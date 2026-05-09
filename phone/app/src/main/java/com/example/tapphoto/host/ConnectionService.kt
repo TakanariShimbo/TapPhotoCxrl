@@ -44,6 +44,9 @@ private sealed class ViewState {
     object Streaming : ViewState()
 }
 
+/** Capture mode mirrored from glass (driven by mode_change event). */
+enum class GlassMode { SHOT, STREAM }
+
 /**
  * Foreground service that holds the CXRL link and renders frames coming from
  * the glass. Wire format:
@@ -147,8 +150,23 @@ class ConnectionService : Service() {
             "frame" -> handleFrame(caps)
             "stream_start" -> handleStreamStart()
             "stream_end" -> handleStreamEnd()
+            "mode_change" -> handleModeChange(caps)
             else -> Log.d(TAG, "ignore unknown glass event: $event")
         }
+    }
+
+    private fun handleModeChange(caps: Caps) {
+        val modeStr = readString(caps, "mode") ?: return
+        val mode = when (modeStr) {
+            "shot" -> GlassMode.SHOT
+            "stream" -> GlassMode.STREAM
+            else -> {
+                Log.w(TAG, "mode_change unknown mode=$modeStr")
+                return
+            }
+        }
+        Log.d(TAG, "<- mode_change $modeStr")
+        _glassMode.value = mode
     }
 
     private fun handleFrame(caps: Caps) {
@@ -171,10 +189,12 @@ class ConnectionService : Service() {
 
     // ---- helpers ----
 
-    private fun readEvent(caps: Caps): String? = runCatching {
+    private fun readEvent(caps: Caps): String? = readString(caps, "event")
+
+    private fun readString(caps: Caps, fieldName: String): String? = runCatching {
         for (i in 0 until caps.size() - 1) {
             val key = caps.at(i)
-            if (key.type() == Caps.Value.TYPE_STRING && key.string == "event") {
+            if (key.type() == Caps.Value.TYPE_STRING && key.string == fieldName) {
                 val v = caps.at(i + 1)
                 if (v.type() == Caps.Value.TYPE_STRING) return@runCatching v.string
             }
@@ -285,6 +305,9 @@ class ConnectionService : Service() {
 
         private val _connState = MutableStateFlow(CxrConnState.DISCONNECTED)
         val connState: StateFlow<CxrConnState> = _connState.asStateFlow()
+
+        private val _glassMode = MutableStateFlow(GlassMode.SHOT)
+        val glassMode: StateFlow<GlassMode> = _glassMode.asStateFlow()
 
         fun start(context: Context) {
             val intent = Intent(context, ConnectionService::class.java)

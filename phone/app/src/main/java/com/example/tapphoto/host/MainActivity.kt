@@ -115,6 +115,7 @@ fun MainScreen(
     val photo by PhotoStore.latest.collectAsState()
     val capturedAt by PhotoStore.capturedAt.collectAsState()
     val fps by FpsTracker.fps.collectAsState()
+    val glassMode by ConnectionService.glassMode.collectAsState()
 
     val notifPermLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestPermission(),
@@ -143,6 +144,8 @@ fun MainScreen(
             hiRokidInstalled = hiRokidInstalled,
             authorized = authorized,
             connection = connection,
+            glassMode = glassMode,
+            modeKnown = connection == ConnectionState.CONNECTED,
         )
         ActionButtons(
             authorized = authorized,
@@ -169,6 +172,8 @@ private fun StatusCard(
     hiRokidInstalled: Boolean,
     authorized: Boolean,
     connection: ConnectionState,
+    glassMode: GlassMode,
+    modeKnown: Boolean,
 ) {
     ElevatedCard(modifier = Modifier.fillMaxWidth()) {
         Column(
@@ -179,6 +184,7 @@ private fun StatusCard(
             StatusRow("Hi Rokid", if (hiRokidInstalled) "installed" else "not installed")
             StatusRow("Authorization", if (authorized) "yes" else "no")
             StatusRow("Connection", connection.name.lowercase())
+            StatusRow("Mode", if (modeKnown) glassMode.name.lowercase() else "—")
         }
     }
 }

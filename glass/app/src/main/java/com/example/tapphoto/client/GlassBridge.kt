@@ -116,7 +116,12 @@ object GlassBridge {
 
     private fun handlePhoneEvent(event: String) {
         when (event) {
-            "session_open", "ping" -> {
+            "session_open" -> {
+                _sessionOpen.value = true
+                armPingWatchdog()
+                sendModeChange()  // resync: phone may have just (re)connected
+            }
+            "ping" -> {
                 _sessionOpen.value = true
                 armPingWatchdog()
             }
@@ -153,6 +158,7 @@ object GlassBridge {
             CaptureMode.SHOT -> CaptureMode.STREAM
             CaptureMode.STREAM -> CaptureMode.SHOT
         }
+        sendModeChange()
     }
 
     private fun tapInShotMode() {
@@ -292,6 +298,19 @@ object GlassBridge {
         }
         runCatching { b.sendMessage(CHANNEL_TO_PHONE, caps) }
             .onFailure { Log.w(TAG, "sendMessage($event) failed", it) }
+    }
+
+    private fun sendModeChange() {
+        val b = bridge ?: return
+        val modeStr = if (_mode.value == CaptureMode.SHOT) "shot" else "stream"
+        Log.d(TAG, "-> mode_change ($modeStr)")
+        val caps = Caps().apply {
+            write("event"); write("mode_change")
+            write("mode"); write(modeStr)
+            write("ts"); writeInt64(System.currentTimeMillis())
+        }
+        runCatching { b.sendMessage(CHANNEL_TO_PHONE, caps) }
+            .onFailure { Log.w(TAG, "sendModeChange failed", it) }
     }
 
     private fun sendFrame(kind: String, jpeg: ByteArray, w: Int, h: Int, rot: Int): Boolean {
