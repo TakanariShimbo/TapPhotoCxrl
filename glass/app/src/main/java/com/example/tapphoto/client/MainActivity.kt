@@ -1,11 +1,15 @@
 package com.example.tapphoto.client
 
+import android.Manifest
+import android.content.pm.PackageManager
 import android.os.Bundle
 import android.view.KeyEvent
 import android.view.WindowManager
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.core.content.ContextCompat
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
@@ -21,37 +25,59 @@ import androidx.compose.ui.unit.sp
 
 class MainActivity : ComponentActivity() {
 
+    private val cameraPermission = registerForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { /* result observed via checkSelfPermission at capture time */ }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-        GlassBridge.init()
+        GlassBridge.init(applicationContext)
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) !=
+            PackageManager.PERMISSION_GRANTED
+        ) {
+            cameraPermission.launch(Manifest.permission.CAMERA)
+        }
         setContent {
             val bridgeStatus by GlassBridge.status.collectAsState()
             val sessionOpen by GlassBridge.sessionOpen.collectAsState()
-            val photoState by GlassBridge.photoState.collectAsState()
-            PhotoScreen(
+            val captureState by GlassBridge.captureState.collectAsState()
+            val mode by GlassBridge.mode.collectAsState()
+            CaptureScreen(
                 bridgeStatus = bridgeStatus,
                 sessionOpen = sessionOpen,
-                photoState = photoState,
+                captureState = captureState,
+                mode = mode,
             )
         }
     }
 
     override fun dispatchKeyEvent(event: KeyEvent): Boolean {
-        if (event.keyCode != KeyEvent.KEYCODE_ENTER) return super.dispatchKeyEvent(event)
+        val handled = when (event.keyCode) {
+            KeyEvent.KEYCODE_ENTER,
+            KeyEvent.KEYCODE_DPAD_LEFT,
+            KeyEvent.KEYCODE_DPAD_RIGHT -> true
+            else -> false
+        }
+        if (!handled) return super.dispatchKeyEvent(event)
         if (event.action == KeyEvent.ACTION_DOWN) {
-            GlassBridge.requestPhoto()
+            when (event.keyCode) {
+                KeyEvent.KEYCODE_ENTER -> GlassBridge.onTap()
+                KeyEvent.KEYCODE_DPAD_LEFT,
+                KeyEvent.KEYCODE_DPAD_RIGHT -> GlassBridge.toggleMode()
+            }
         }
         return true
     }
 }
 
 @Composable
-fun PhotoScreen(
+fun CaptureScreen(
     bridgeStatus: BridgeStatus,
     sessionOpen: Boolean,
-    photoState: PhotoState,
+    captureState: CaptureState,
+    mode: CaptureMode,
 ) {
     Box(
         modifier = Modifier
@@ -67,7 +93,7 @@ fun PhotoScreen(
             !fullyConnected -> {
                 Text(text = "Phone not connected", color = Color(0xFFC04040), fontSize = 32.sp)
             }
-            else -> CaptureFx(state = photoState)
+            else -> CaptureFx(state = captureState, mode = mode)
         }
     }
 }
@@ -75,23 +101,23 @@ fun PhotoScreen(
 @Preview(showBackground = true, backgroundColor = 0xFF000000, widthDp = 480, heightDp = 270)
 @Composable
 private fun IdlePreview() {
-    PhotoScreen(BridgeStatus.CONNECTED, sessionOpen = true, photoState = PhotoState.IDLE)
+    CaptureScreen(BridgeStatus.CONNECTED, sessionOpen = true, captureState = CaptureState.IDLE, mode = CaptureMode.SHOT)
 }
 
 @Preview(showBackground = true, backgroundColor = 0xFF000000, widthDp = 480, heightDp = 270)
 @Composable
 private fun CapturingPreview() {
-    PhotoScreen(BridgeStatus.CONNECTED, sessionOpen = true, photoState = PhotoState.CAPTURING)
+    CaptureScreen(BridgeStatus.CONNECTED, sessionOpen = true, captureState = CaptureState.CAPTURING, mode = CaptureMode.SHOT)
 }
 
 @Preview(showBackground = true, backgroundColor = 0xFF000000, widthDp = 480, heightDp = 270)
 @Composable
 private fun CapturedPreview() {
-    PhotoScreen(BridgeStatus.CONNECTED, sessionOpen = true, photoState = PhotoState.CAPTURED)
+    CaptureScreen(BridgeStatus.CONNECTED, sessionOpen = true, captureState = CaptureState.CAPTURED, mode = CaptureMode.SHOT)
 }
 
 @Preview(showBackground = true, backgroundColor = 0xFF000000, widthDp = 480, heightDp = 270)
 @Composable
 private fun DisconnectedPreview() {
-    PhotoScreen(BridgeStatus.DISCONNECTED, sessionOpen = false, photoState = PhotoState.IDLE)
+    CaptureScreen(BridgeStatus.DISCONNECTED, sessionOpen = false, captureState = CaptureState.IDLE, mode = CaptureMode.SHOT)
 }

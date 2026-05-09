@@ -114,6 +114,7 @@ fun MainScreen(
     }
     val photo by PhotoStore.latest.collectAsState()
     val capturedAt by PhotoStore.capturedAt.collectAsState()
+    val fps by FpsTracker.fps.collectAsState()
 
     val notifPermLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestPermission(),
@@ -157,6 +158,7 @@ fun MainScreen(
         PhotoPanel(
             image = photo,
             capturedAt = capturedAt,
+            fps = fps,
             onClear = PhotoStore::clear,
         )
     }
@@ -226,6 +228,7 @@ private fun ActionButtons(
 private fun PhotoPanel(
     image: ImageBitmap?,
     capturedAt: Long?,
+    fps: Float,
     onClear: () -> Unit,
 ) {
     Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
@@ -234,10 +237,10 @@ private fun PhotoPanel(
             horizontalArrangement = Arrangement.SpaceBetween,
             verticalAlignment = Alignment.CenterVertically,
         ) {
-            val title = if (capturedAt != null) {
-                "最新の写真 (${timeFmt.format(Date(capturedAt))})"
-            } else {
-                "最新の写真"
+            val title = when {
+                fps > 0.1f -> "ライブ映像 (%.1f fps)".format(fps)
+                capturedAt != null -> "最新の写真 (${timeFmt.format(Date(capturedAt))})"
+                else -> "最新の写真"
             }
             Text(title, style = MaterialTheme.typography.titleSmall)
             TextButton(onClick = onClear, enabled = image != null) { Text("Clear") }

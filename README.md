@@ -1,16 +1,20 @@
 # TapPhotoCxrl
 
-**グラスのタップで写真を撮ってスマホで表示する**最小サンプル。`HelloToggleCxrl` の骨格 (Foreground Service による CXR-L 接続常駐 + application-level handshake / heartbeat) をそのまま流用し、双方向通信のペイロードだけ「写真リクエスト / 撮影結果」に置き換えてある。
+**グラスのタップで写真を撮ってスマホで表示する**最小サンプル。`HelloToggleCxrl` の骨格 (Foreground Service による CXR-L 接続常駐 + application-level handshake / heartbeat) を流用しつつ、撮影は **グラス側で Camera2 を直接叩く** 方式。Hi Rokid の `takePhoto()` は使わないので、システム標準の撮影オーバーレイ (右上の小さいプレビュー画像) も出ない。
 
 ## このプロジェクトの狙い
 
-- **グラスでタップ** → スマホ側の CXR-L SDK が `takePhoto()` を発行 → 撮影バイトが返ってきたらスマホに表示
-- グラス側はビュー HUD として **緑のコーナーブラケット → 白フラッシュ → ✓** のシンプルなキャプチャ演出 + シャッター音
+- **SHOT モード**: グラスでタップ → グラス側 Camera2 で 1024×768 を 1 枚撮影 → JPEG をスマホへ送って最新 1 枚として表示
+- **STREAM モード**: グラスでタップで開始/停止 → グラス側 Camera2 で 480×360 を連続キャプチャ → スマホでライブプレビュー (fps 表示付き)
+- **モード切替**: グラスで前後スワイプ (DPAD_LEFT / DPAD_RIGHT) → SHOT ⇄ STREAM
+- グラス側は HUD として **緑のコーナーブラケット → 白フラッシュ → ✓** のキャプチャ演出 + シャッター音 + 上端にモードバッジ (`SHOT` / `● STREAM`)
 - スマホ側は **最新 1 枚** だけを保持 (履歴やストレージ書き出しはなし)
 
-撮影自体は CXR-L SDK の `takePhoto(width, height, quality)` がスマホ→グラスの内部チャネルで完結させるため、**グラス側にカメラ実装は不要**。グラス側 APK が要るのは CUSTOMAPP セッション (= CustomCMD = グラスからのタップトリガー送信) を成立させるためだけ。
+撮影パイプラインは `GlassCamera` (`glass/.../client/GlassCamera.kt`) に閉じ込めてあり、API は `takeShot(...)` / `startStream(...)` + `stopStream()` の 2 系統だけ。Hi Rokid `takePhoto()` の代替として使える。
 
 撮影演出 (`CaptureFx.kt`) は **画像アセット 0 / Compose `Canvas` で線描画** + **`ToneGenerator` で合成シャッター音**。色・サイズ・タイミングは全てファイル先頭の定数で調整可能。
+
+> なぜ自前 Camera2 にしたか: Hi Rokid `takePhoto()` の各回で **撮影完了オーバーレイがグラス HUD に常時出る** (連射でも消えない)。SDK 側にキャンセル API も無く `sendExit` も効かなかったため、**Hi Rokid のカメラ層を経由しない** 方針に切り替えた。トランスポート (CustomCMD) だけは Hi Rokid の ARTC を借用している。
 
 ## このリポジトリと依存リポジトリ
 
@@ -35,7 +39,7 @@
 | ② Caps (phone) | `com.rokid.cxr:client-l:1.0.1` (Rokid maven) | Wire 互換のため本家 SDK の Caps シリアライザだけ借用 |
 | ② Bridge (glass) | `com.rokid.cxr:cxr-service-bridge:1.0-20260212.103714-88` (Rokid maven) | グラス側の `CXRServiceBridge` 実装 |
 
-> ベースは [HelloToggleCxrl](https://github.com/TakanariShimbo/HelloToggleCxrl)。ハンドシェイク / heartbeat / Foreground Service / 認証フローはそのまま、ペイロード部分だけ写真用に差し替えている。
+> ベースは [HelloToggleCxrl](https://github.com/TakanariShimbo/HelloToggleCxrl)。ハンドシェイク / heartbeat / Foreground Service / 認証フローはそのまま、ペイロード部分は写真 (グラス側 Camera2 → JPEG → スマホ) に差し替えている。
 
 ## 端末構成
 
@@ -44,36 +48,54 @@
 | 端末 | Pixel 8 (Android 14+) | Rokid Glasses (YodaOS SPRITE / Android 12 ベース) |
 | 表示名 | `TapPhotoCxrl Host` | `TapPhotoCxrl Client` |
 | パッケージ | `com.example.tapphoto.host` | `com.example.tapphoto.client` |
-| 役割 | 認証 / 接続維持 / 撮影 API 呼び出し / 画像表示 | UI 描画 / タップ受信 / リクエスト送信 |
+| 役割 | 認証 / 接続維持 / 受信画像表示 | UI 描画 / タップ受信 / **Camera2 撮影** / JPEG 送信 |
 
 ## 動作概要
 
 ### グラス側
-| State | 画面 | 音 |
-|---|---|---|
-| **IDLE** | 「タップで撮影」(灰) | 無音 |
-| **CAPTURING** | 緑のコーナーブラケット (4 隅 L 字) が `scaleIn 1.06→1.0 + fadeIn` で出現 | 無音 |
-| **CAPTURED** | 枠内のみ白フラッシュ (alpha 0→0.45→0、220ms) + 中央に ✓ がスケールイン | `ToneGenerator` の `TONE_PROP_BEEP2` (シャッター "ピッ") |
-| **FAILED** | 「撮影失敗」(赤) | `TONE_PROP_NACK` (失敗 "ブッ") |
-| 接続中/未接続 | 「Connecting…」(灰) / 「Phone not connected」(赤) | — |
+画面上端中央にモードバッジ: `SHOT` / `● STREAM` (STREAM 中は赤丸が点滅)。
 
-CAPTURED / FAILED は **2 秒後に Idle 復帰**。
+| Mode | State | 画面 | 音 |
+|---|---|---|---|
+| SHOT | IDLE | 「タップで撮影」(灰) | 無音 |
+| SHOT | CAPTURING | 緑のコーナーブラケットが `scaleIn 1.06→1.0 + fadeIn` で出現 | 無音 |
+| SHOT | CAPTURED | 枠内のみ白フラッシュ + 中央に ✓ がスケールイン | `TONE_PROP_BEEP2` (シャッター "ピッ") |
+| SHOT | FAILED | 「撮影失敗」(赤) | `TONE_PROP_NACK` (失敗 "ブッ") |
+| STREAM | IDLE | 「タップでストリーム」(灰) | 無音 |
+| STREAM | STREAMING | コーナーブラケット常時表示 + 「タップで停止」(下端、点滅) | 無音 |
+| STREAM | FAILED | 「ストリーム失敗」(赤) | `TONE_PROP_NACK` |
+| 接続中/未接続 | — | 「Connecting…」(灰) / 「Phone not connected」(赤) | — |
+
+CAPTURED / FAILED は **2 秒後に IDLE 復帰**。STREAMING は次のタップ (停止) または接続喪失まで継続。
 
 | ジェスチャ | キーコード | 動作 |
 |---|---|---|
-| シングルタップ | `KEYCODE_ENTER` | 撮影リクエストをスマホへ送信 |
+| シングルタップ | `KEYCODE_ENTER` | SHOT: 1 枚撮影 / STREAM: 開始⇄停止トグル |
+| 前/後スワイプ | `KEYCODE_DPAD_LEFT/RIGHT` | モードトグル (SHOT ⇄ STREAM)。STREAM 中なら停止してから切替 |
 
-その他のキーは system に通す (ダブルタップでアプリ終了など標準動作)。
+ブラケット / ✓ / フラッシュ / モードバッジ は画像アセットを使わず Compose `Canvas` の `Path` で描画。シャッター音は `ToneGenerator` の合成音 (アセット同梱なし)。
 
-ブラケット / ✓ / フラッシュは画像アセットを使わず Compose `Canvas` の `Path` で描画 (どの解像度でもジャギなし)。シャッター音は `ToneGenerator` の合成音 (アセット同梱なし)。
+撮影パイプライン (`GlassCamera`):
+
+1. `CameraDevice.openCamera` → `CameraCaptureSession` を `[previewSurface, jpegReader.surface]` 2 面で構成
+2. `TEMPLATE_PREVIEW` を repeating で流して AE/AWB を収束させる (起動直後のみ **700ms warmup**)
+3. `TEMPLATE_STILL_CAPTURE` を 1 ショット投げる → `ImageReader.OnImageAvailableListener` で JPEG bytes を取得
+4. STREAM では 3 を `STREAM_FRAME_GAP_MS` (250ms) ごとに繰り返す。SHOT は 1 回だけ
+5. 取得した JPEG は **回転を適用せず**、Caps に `rot = SENSOR_ORIENTATION` を載せて送信 (回転はスマホ側で実施)
 
 ### スマホ側
 - Hi Rokid 認証 → token を `EncryptedSharedPreferences` に永続化
 - Foreground Service (`dataSync` 型) が CXR-L 接続を常駐
-- 接続状態カード + 操作ボタン + **最新の写真パネル** (アスペクト 4:3、`fit` スケール)
-- グラスから `request_photo` を受け取ったら `cxrLink.takePhoto(1024, 768, 80)` を発行
-- バイト列受信 → `BitmapFactory.decodeByteArray` → `PhotoStore` に格納 → `photo_done` をグラスへ返送
-- 失敗時は `photo_failed` を返送
+- 接続状態カード + 操作ボタン + **写真/ライブパネル** (アスペクト 4:3、`fit` スケール)
+- パネルのタイトルは状態によって変化:
+  - 通常: 「最新の写真 (HH:mm:ss)」
+  - STREAM 中: 「**ライブ映像 (X.X fps)**」 — `FpsTracker` がローリング平均で算出
+- グラスからのイベント別動作:
+  - `frame{kind=shot, w, h, rot, data}` → `GlassImage.decodeFrame` で回転込み Bitmap → `PhotoStore`
+  - `frame{kind=stream, ...}` → 同上 + `FpsTracker.tick`
+  - `stream_start` → 内部状態 `Streaming` へ。FpsTracker reset
+  - `stream_end` → 内部状態 `Idle` へ
+- スマホ→グラスの送信は `session_open` / `ping` / `session_close` のみ (撮影トリガは glass-local)
 
 ## アーキテクチャ
 
@@ -82,22 +104,29 @@ phone:                                     glass:
 ┌──────────────┐  rk_custom_client  ┌──────────────┐
 │   Compose    │   session_open     │              │
 │   MainAct    │   ping (5s)        │              │
-│   PhotoStore │   photo_done       │              │
-│      ▲       │   photo_failed     │              │
-│      │       │ ─────────────────▶ │   Compose    │
-│ ConnectionSv │                    │   MainAct    │
-│ (Foreground) │                    │      ▲       │
-│   CXRLink    │                    │      │       │
-│   takePhoto  │                    │      │       │
-│   ImageCbk   │  rk_custom_key     │ GlassBridge  │
-│      ▲       │  ◀───────────────  │ CXRServiceBr │
-│      │       │  request_photo     │              │
+│   PhotoStore │   session_close    │              │
+│      ▲       │ ─────────────────▶ │  Compose     │
+│      │       │                    │  MainAct     │
+│ ConnectionSv │                    │  GlassBridge │
+│ (Foreground) │                    │     │        │
+│   CXRLink    │  rk_custom_key     │     ▼        │
+│   GlassImage │  ◀───────────────  │  GlassCamera │
+│      ▲       │  frame (binary)    │  (Camera2)   │
+│      │       │  stream_start      │              │
+│      │       │  stream_end        │              │
 └──────────────┘                    └──────────────┘
        │                                   │
        └───────── Hi Rokid (BT) ───────────┘
 ```
 
+### glass-driven な責任分担
+
+- **撮影トリガ・状態管理・UI フィードバック (シャッター音/✓ 表示)** は全部 glass-local
+- スマホは「受信した JPEG を表示するだけ」のステートレス viewer
+- スマホ→glass の制御メッセージは存在しない (heartbeat と session lifecycle だけ)
+
 ### セッション handshake & heartbeat
+
 HelloToggleCxrl と同じ application-level セッションを継承。
 
 - phone が `appStart` 成功後に `session_open` を送信し、以降 5 秒ごとに `ping` を流す
@@ -107,24 +136,36 @@ HelloToggleCxrl と同じ application-level セッションを継承。
 
 ## 通信プロトコル
 
-| チャンネル | 方向 | 用途 |
+| チャンネル | 方向 | `event` の取りうる値 |
 |---|---|---|
-| `rk_custom_client` | phone → glass | `event` ∈ {`session_open`, `session_close`, `ping`, `photo_done`, `photo_failed`} |
-| `rk_custom_key` | glass → phone | `event` = `request_photo` |
+| `rk_custom_client` | phone → glass | `session_open` / `session_close` / `ping` |
+| `rk_custom_key` | glass → phone | `frame` (binary 画像) / `stream_start` / `stream_end` |
 
-ペイロードは `com.rokid.cxr.Caps` を positional で書き込み (キー文字列とその値が交互に並ぶ)。すべてのフレーム共通フォーマット:
+ペイロードは `com.rokid.cxr.Caps` を positional で書き込み (キー文字列とその値が交互に並ぶ)。共通フィールド:
 
 ```
 write("event"), write(<event>)
 write("ts"),    writeInt64(<epoch ms>)
 ```
 
+`frame` イベントだけ追加フィールドあり:
+
+```
+write("kind"), write("shot" | "stream")
+write("w"),    writeInt32(<width>)
+write("h"),    writeInt32(<height>)
+write("rot"),  writeInt32(<degrees, 通常 SENSOR_ORIENTATION>)
+write("data"), write(<JPEG bytes>)         // TYPE_BINARY
+```
+
+> JPEG は Caps の binary フィールドに直接埋め込んで送る。`CXRServiceBridge.sendMessage(String, Caps, byte[])` の別 byte 引数経路は phone 側 (CXR-L) から拾えないため、Caps 内 binary に統一している。1024×768 q=80 で約 50KB / 480×360 q=50 で約 5KB の payload で動作確認済み。
+
 ## 動作要件
 
 | カテゴリ | 必要条件 | 動作確認済み |
 |---|---|---|
 | スマホ | Android (minSdk 31 / compileSdk 36) | Google Pixel 8 / Android 16 (SDK 36) |
-| グラス | スマホとペアリング済みであること | Rokid Glasses / YodaOS SPRITE 1.18.007-20260427-150201 |
+| グラス | スマホとペアリング済み + `CAMERA` 権限付与 | Rokid Glasses / YodaOS SPRITE 1.18.007-20260427-150201 |
 | Hi Rokid アプリ | グローバル版 (`com.rokid.sprite.global.aiapp`) インストール済み | G1.5.9.0408 (versionCode 10050009) |
 | ビルド環境 | Android Studio (Kotlin 2.2.10 / AGP 9.2.0 / Compose BOM 2026.02.01) | — |
 
@@ -161,7 +202,8 @@ export PATH=$JAVA_HOME/bin:$PATH
 ```bash
 cd TapPhotoCxrl/glass
 ./gradlew installDebug
-# (もしくは ./gradlew assembleDebug → adb install で手動)
+# 初回は CAMERA 権限ダイアログが出る。Hi Rokid 経由起動だと dialog を見逃すことがあるので
+# その場合は: adb shell pm grant com.example.tapphoto.client android.permission.CAMERA
 ```
 
 ### 5. スマホ側アプリをビルド & スマホへ投入
@@ -175,20 +217,38 @@ cd ../phone
 
 1. スマホでアプリ起動 → `[認証]` (初回のみ、グローバル版 Hi Rokid の認証ダイアログが出る)
 2. `[接続開始]` → 通知バーに Foreground Service の通知が出る
-3. グラス側に `com.example.tapphoto.client` が自動起動して「タップで撮影」が表示される
-4. グラスをタップ → 緑コーナーブラケット出現 → 数秒後にスマホへ画像が出る + グラスは枠内フラッシュ + ✓ + シャッター音 (2 秒後に Idle へ)
+3. グラス側に `com.example.tapphoto.client` が自動起動して「タップで撮影」(SHOT mode) が表示される
+4. **SHOT**: グラスをタップ → ブラケット出現 → ~1.5 秒後にスマホへ画像 + グラスは枠内フラッシュ + ✓ + シャッター音
+5. **STREAM**: 前/後スワイプ → モードバッジが `● STREAM` に → タップで連続撮影開始 → スマホ側パネルが「ライブ映像 (fps)」に切替 → もう一度タップで停止
 
 接続を切るときはスマホで `[接続停止]`。再認証は `[再認証]` で token を破棄。
 
 ## チューニング可能な定数
 
-### 撮影パラメータ (`phone/app/src/main/java/com/example/tapphoto/host/ConnectionService.kt`)
+### 撮影パラメータ (`glass/app/src/main/java/com/example/tapphoto/client/GlassBridge.kt`)
 
 ```kotlin
-private const val PHOTO_WIDTH = 1024
-private const val PHOTO_HEIGHT = 768
-private const val PHOTO_QUALITY = 80
+// SHOT モード
+private const val SHOT_TARGET_W = 1024
+private const val SHOT_TARGET_H = 768
+private const val SHOT_QUALITY = 80
+
+// STREAM モード (低解像度・低品質で fps を稼ぐ)
+private const val STREAM_TARGET_W = 480
+private const val STREAM_TARGET_H = 360
+private const val STREAM_QUALITY = 50
 ```
+
+`GlassCamera` 側はターゲットサイズに最も近い「**同じアスペクト比**」の出力サイズを自動選択 (4:3 を target にすれば 4:3 が選ばれる)。
+
+### Camera2 ループ (`glass/app/src/main/java/com/example/tapphoto/client/GlassCamera.kt`)
+
+```kotlin
+private const val STREAM_FRAME_GAP_MS = 250L   // 連続キャプチャ間隔 (実 fps はカメラ側律速とのminで決まる)
+private const val WARMUP_MS = 700L             // preview 開始から初回キャプチャまで
+```
+
+`WARMUP_MS` は AE / AWB が収束する時間。短くすると初回フレームの色味が崩れる。
 
 ### グラス HUD の見た目 (`glass/app/src/main/java/com/example/tapphoto/client/CaptureFx.kt`)
 
@@ -209,8 +269,9 @@ private const val FLASH_PEAK_ALPHA = 0.45f           // フラッシュ最大不
 ## トラブルシューティング
 
 - **Hi Rokid 行が `not installed`**: グローバル版 (`com.rokid.sprite.global.aiapp`) がインストールされていない、または `phone/app/src/main/AndroidManifest.xml` の `<queries>` 漏れ
-- **タップしてもブラケットが出たまま戻らない**: `onImageReceived` / `onImageError` のどちらも届いていない。logcat で `ConnectionService` タグの `takePhoto` / `onImageReceived` を確認
-- **「撮影失敗」が出る**: `takePhoto` が同期的に false を返したか、SDK 内部エラー。logcat の `onImageError code=...` を確認
+- **タップしても何も起きない / カメラが開かない**: glass の CAMERA 権限未付与。`adb shell pm grant com.example.tapphoto.client android.permission.CAMERA` で明示付与
+- **ストリームの 1 枚目だけ色味がおかしい**: `WARMUP_MS` が短すぎる可能性。`GlassCamera.kt` で値を上げて再ビルド
+- **STREAM 中のスマホ側 fps が出ない / 1 fps 未満**: glass 側 capture が律速。`STREAM_QUALITY` / 解像度を下げる
 - **グラス側が `Phone not connected` のまま**: phone 側 Foreground Service が起動していない、または phone がサイレント kill された。スマホで `[接続開始]` を押し直す
 - **ビルド時に `Could not resolve com.example.cxrglobal:lib`**: CxrGlobal リポを並列に clone していない、または `phone/settings.gradle.kts` の `includeBuild` パスが合っていない
 
@@ -220,3 +281,4 @@ private const val FLASH_PEAK_ALPHA = 0.45f           // フラッシュ最大不
 - BT 物理切断 → 復帰時の自動再接続なし (手動で `[接続停止]` → `[接続開始]`)
 - token 期限切れの自動検出なし
 - グラス用 APK の自動デプロイは未実装 (手動 `adb install` 想定)
+- glass 側 Camera2 でカメラを掴んでいる間 Hi Rokid 純正のカメラ機能 (シャッターボタン撮影など) と競合する可能性 (現状未確認)

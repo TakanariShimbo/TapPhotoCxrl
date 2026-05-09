@@ -13,7 +13,6 @@ import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
 import android.util.Log
-import android.graphics.BitmapFactory
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.core.app.NotificationCompat
 import com.example.cxrglobal.CXRLink
@@ -21,7 +20,6 @@ import com.example.cxrglobal.CxrDefs
 import com.example.cxrglobal.callbacks.ICXRLinkCbk
 import com.example.cxrglobal.callbacks.ICustomCmdCbk
 import com.example.cxrglobal.callbacks.IGlassAppCbk
-import com.example.cxrglobal.callbacks.IImageStreamCbk
 import com.rokid.cxr.Caps
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -35,20 +33,36 @@ private const val GLASS_MAIN_ACTIVITY = "com.example.tapphoto.client.MainActivit
 private const val CHANNEL_TO_GLASS = "rk_custom_client"
 private const val CHANNEL_FROM_GLASS = "rk_custom_key"
 private const val HEARTBEAT_INTERVAL_MS = 5_000L
-private const val PHOTO_WIDTH = 1024
-private const val PHOTO_HEIGHT = 768
-private const val PHOTO_QUALITY = 80
 
+/**
+ * Phone-side viewer state. Glass owns capture lifecycle; phone is passive.
+ *  - Idle: showing whatever the most recent shot was (or nothing)
+ *  - Streaming: a stream is active on glass; tick FPS, show LIVE indicator
+ */
+private sealed class ViewState {
+    object Idle : ViewState()
+    object Streaming : ViewState()
+}
+
+/**
+ * Foreground service that holds the CXRL link and renders frames coming from
+ * the glass. Wire format:
+ *   phone → glass:  session_open / ping / session_close
+ *   glass → phone:  frame (binary) / stream_start / stream_end
+ */
 class ConnectionService : Service() {
 
     private var cxrLink: CXRLink? = null
     private var lConnected = false
     private var btConnected = false
     private var appStarted = false
+
     private val mainHandler = Handler(Looper.getMainLooper())
+    private var view: ViewState = ViewState.Idle
+
     private val heartbeatRunnable = object : Runnable {
         override fun run() {
-            sendSessionEvent("ping")
+            sendCapsEvent("ping")
             mainHandler.postDelayed(this, HEARTBEAT_INTERVAL_MS)
         }
     }
@@ -75,13 +89,15 @@ class ConnectionService : Service() {
 
     override fun onDestroy() {
         _running.value = false
-        mainHandler.removeCallbacks(heartbeatRunnable)
-        sendSessionEvent("session_close")
+        mainHandler.removeCallbacksAndMessages(null)
+        sendCapsEvent("session_close")
         runCatching { cxrLink?.disconnect() }
         cxrLink = null
         lConnected = false
         btConnected = false
         appStarted = false
+        view = ViewState.Idle
+        FpsTracker.reset()
         _connState.value = CxrConnState.DISCONNECTED
         stopForeground(STOP_FOREGROUND_REMOVE)
         super.onDestroy()
@@ -94,10 +110,7 @@ class ConnectionService : Service() {
         updateConnectionState(CxrConnState.CONNECTING, "接続中…")
         cxrLink = CXRLink(this).apply {
             configCXRSession(
-                CxrDefs.CXRSession(
-                    CxrDefs.CXRSessionType.CUSTOMAPP,
-                    GLASS_APP_PKG,
-                ),
+                CxrDefs.CXRSession(CxrDefs.CXRSessionType.CUSTOMAPP, GLASS_APP_PKG),
             )
             setCXRLinkCbk(object : ICXRLinkCbk {
                 override fun onCXRLConnected(connected: Boolean) {
@@ -119,46 +132,44 @@ class ConnectionService : Service() {
                 override fun onCustomCmdResult(key: String, payload: ByteArray) {
                     if (key != CHANNEL_FROM_GLASS) return
                     val caps = Caps.fromBytes(payload) ?: return
-                    when (readEvent(caps)) {
-                        "request_photo" -> requestPhotoCapture()
-                    }
-                }
-            })
-            setCXRImageCbk(object : IImageStreamCbk {
-                override fun onImageReceived(data: ByteArray) {
-                    Log.d(TAG, "onImageReceived bytes=${data.size}")
-                    val bitmap = BitmapFactory.decodeByteArray(data, 0, data.size)
-                    if (bitmap == null) {
-                        Log.w(TAG, "decode failed")
-                        sendSessionEvent("photo_failed")
-                        return
-                    }
-                    PhotoStore.set(bitmap.asImageBitmap())
-                    sendSessionEvent("photo_done")
-                }
-
-                override fun onImageError(code: Int, msg: String?) {
-                    Log.w(TAG, "onImageError code=$code msg=$msg")
-                    sendSessionEvent("photo_failed")
+                    val event = readEvent(caps) ?: return
+                    mainHandler.post { handleGlassMessage(event, caps) }
                 }
             })
             connect(token)
         }
     }
 
-    private fun requestPhotoCapture() {
-        val link = cxrLink
-        if (link == null) {
-            Log.w(TAG, "requestPhotoCapture: no link")
-            sendSessionEvent("photo_failed")
-            return
+    // ---- glass → phone ----
+
+    private fun handleGlassMessage(event: String, caps: Caps) {
+        when (event) {
+            "frame" -> handleFrame(caps)
+            "stream_start" -> handleStreamStart()
+            "stream_end" -> handleStreamEnd()
+            else -> Log.d(TAG, "ignore unknown glass event: $event")
         }
-        Log.d(TAG, "takePhoto ${PHOTO_WIDTH}x${PHOTO_HEIGHT} q=$PHOTO_QUALITY")
-        val accepted = runCatching {
-            link.takePhoto(PHOTO_WIDTH, PHOTO_HEIGHT, PHOTO_QUALITY)
-        }.onFailure { Log.w(TAG, "takePhoto threw", it) }.getOrDefault(false)
-        if (!accepted) sendSessionEvent("photo_failed")
     }
+
+    private fun handleFrame(caps: Caps) {
+        val bitmap = GlassImage.decodeFrame(caps) ?: return
+        PhotoStore.set(bitmap.asImageBitmap())
+        if (view is ViewState.Streaming) FpsTracker.tick()
+    }
+
+    private fun handleStreamStart() {
+        Log.d(TAG, "<- stream_start (was=$view)")
+        view = ViewState.Streaming
+        FpsTracker.reset()
+    }
+
+    private fun handleStreamEnd() {
+        Log.d(TAG, "<- stream_end (was=$view)")
+        view = ViewState.Idle
+        FpsTracker.reset()
+    }
+
+    // ---- helpers ----
 
     private fun readEvent(caps: Caps): String? = runCatching {
         for (i in 0 until caps.size() - 1) {
@@ -182,26 +193,31 @@ class ConnectionService : Service() {
             CxrConnState.DISCONNECTED -> "切断"
         }
         updateConnectionState(state, text)
+        if (state != CxrConnState.CONNECTED && view is ViewState.Streaming) {
+            Log.d(TAG, "disconnect: clearing Streaming view state")
+            view = ViewState.Idle
+            FpsTracker.reset()
+        }
         if (state == CxrConnState.CONNECTED && !appStarted) {
             appStarted = true
             Log.d(TAG, "appStart $GLASS_MAIN_ACTIVITY")
             cxrLink?.appStart(GLASS_MAIN_ACTIVITY, object : IGlassAppCbk {
                 override fun onOpenAppResult(success: Boolean) {
                     Log.d(TAG, "onOpenAppResult: $success")
-                    if (success) sendSessionEvent("session_open")
+                    if (success) sendCapsEvent("session_open")
                 }
 
                 override fun onGlassAppResume(resume: Boolean) {
                     Log.d(TAG, "onGlassAppResume: $resume")
-                    if (resume) sendSessionEvent("session_open")
+                    if (resume) sendCapsEvent("session_open")
                 }
             })
         }
     }
 
-    private fun sendSessionEvent(event: String) {
+    private fun sendCapsEvent(event: String) {
         val link = cxrLink ?: return
-        if (event != "ping") Log.d(TAG, "send $event")
+        if (event != "ping") Log.d(TAG, "-> $event")
         val payload = Caps().apply {
             write("event")
             write(event)
@@ -209,7 +225,7 @@ class ConnectionService : Service() {
             writeInt64(System.currentTimeMillis())
         }.serialize()
         runCatching { link.sendCustomCmd(CHANNEL_TO_GLASS, payload) }
-            .onFailure { Log.w(TAG, "sendSessionEvent($event) failed", it) }
+            .onFailure { Log.w(TAG, "sendCapsEvent($event) failed", it) }
         when (event) {
             "session_open" -> {
                 mainHandler.removeCallbacks(heartbeatRunnable)
@@ -228,11 +244,7 @@ class ConnectionService : Service() {
     private fun startForegroundCompat(text: String) {
         val notif = buildNotification(text)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
-            startForeground(
-                NOTIF_ID,
-                notif,
-                ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC,
-            )
+            startForeground(NOTIF_ID, notif, ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC)
         } else {
             startForeground(NOTIF_ID, notif)
         }
