@@ -123,6 +123,8 @@ fun MainScreen(
     val glassMode by ConnectionService.glassMode.collectAsState()
     val streaming by ConnectionService.streaming.collectAsState()
     val streamFrameCount by StreamRecorder.frameCount.collectAsState()
+    val voiceRecording by VoiceRecorder.recording.collectAsState()
+    val voiceHasContent by VoiceRecorder.hasContent.collectAsState()
     val scope = rememberCoroutineScope()
 
     val notifPermLauncher = rememberLauncherForActivityResult(
@@ -174,32 +176,49 @@ fun MainScreen(
         )
         SaveButton(
             streaming = streaming,
+            recording = voiceRecording,
             videoFrameCount = streamFrameCount,
+            hasVoice = voiceHasContent,
             hasPhoto = latestFrame != null,
             onSave = {
-                if (streamFrameCount > 0 && !streaming) {
-                    val frames = StreamRecorder.snapshot()
-                    if (frames.isEmpty()) return@SaveButton
-                    scope.launch {
-                        val name = "tapphoto_${fileFmt.format(Date())}.mp4"
-                        Toast.makeText(context, "エンコード中…", Toast.LENGTH_SHORT).show()
-                        val uri = MediaSaver.saveVideo(context, frames, StreamRecorder.periodMs, name)
-                        Toast.makeText(
-                            context,
-                            if (uri != null) "保存しました: Movies/TapPhotoCxrl/$name" else "保存に失敗",
-                            Toast.LENGTH_LONG,
-                        ).show()
+                when {
+                    streamFrameCount > 0 && !streaming -> {
+                        val frames = StreamRecorder.snapshot()
+                        if (frames.isEmpty()) return@SaveButton
+                        scope.launch {
+                            val name = "tapphoto_${fileFmt.format(Date())}.mp4"
+                            Toast.makeText(context, "エンコード中…", Toast.LENGTH_SHORT).show()
+                            val uri = MediaSaver.saveVideo(context, frames, StreamRecorder.periodMs, name)
+                            Toast.makeText(
+                                context,
+                                if (uri != null) "保存しました: Movies/TapPhotoCxrl/$name" else "保存に失敗",
+                                Toast.LENGTH_LONG,
+                            ).show()
+                        }
                     }
-                } else {
-                    val frame = latestFrame ?: return@SaveButton
-                    scope.launch {
-                        val name = "tapphoto_${fileFmt.format(Date())}.jpg"
-                        val uri = MediaSaver.savePhoto(context, frame, name)
-                        Toast.makeText(
-                            context,
-                            if (uri != null) "保存しました: Pictures/TapPhotoCxrl/$name" else "保存に失敗",
-                            Toast.LENGTH_SHORT,
-                        ).show()
+                    voiceHasContent && !voiceRecording -> {
+                        val snap = VoiceRecorder.snapshot() ?: return@SaveButton
+                        scope.launch {
+                            val name = "tapphoto_${fileFmt.format(Date())}.wav"
+                            val uri = MediaSaver.saveAudio(context, snap, name)
+                            Toast.makeText(
+                                context,
+                                if (uri != null) "保存しました: Music/TapPhotoCxrl/$name" else "保存に失敗",
+                                Toast.LENGTH_LONG,
+                            ).show()
+                        }
+                    }
+                    else -> {
+                        val frame = latestFrame ?: return@SaveButton
+                        scope.launch {
+                            val name = "tapphoto_${fileFmt.format(Date())}.jpg"
+                            val uri = MediaSaver.savePhoto(context, frame, name)
+                            Toast.makeText(
+                                context,
+                                if (uri != null) "保存しました: Pictures/TapPhotoCxrl/$name" else "保存に失敗",
+                                Toast.LENGTH_SHORT,
+                            ).show()
+                        }
                     }
                 }
             },
@@ -210,15 +229,20 @@ fun MainScreen(
 @Composable
 private fun SaveButton(
     streaming: Boolean,
+    recording: Boolean,
     videoFrameCount: Int,
+    hasVoice: Boolean,
     hasPhoto: Boolean,
     onSave: () -> Unit,
 ) {
     val asVideo = videoFrameCount > 0 && !streaming
-    val enabled = !streaming && (asVideo || hasPhoto)
+    val asAudio = hasVoice && !recording
+    val busy = streaming || recording
+    val enabled = !busy && (asVideo || asAudio || hasPhoto)
     val label = when {
-        streaming -> "保存"
+        busy -> "保存"
         asVideo -> "保存 (動画)"
+        asAudio -> "保存 (音声)"
         hasPhoto -> "保存 (写真)"
         else -> "保存"
     }

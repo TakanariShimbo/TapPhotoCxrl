@@ -42,9 +42,10 @@ enum class CaptureState {
     CAPTURED,    // shot sent, showing brief feedback (auto reset)
     FAILED,      // capture or send failed (auto reset)
     STREAMING,   // continuous capture in flight
+    RECORDING,   // voice recording in flight (audio handled by phone via Hi Rokid)
 }
 
-enum class CaptureMode { SHOT, STREAM }
+enum class CaptureMode { SHOT, STREAM, VOICE }
 
 /**
  * State + protocol owner on the glass. Wire format:
@@ -168,6 +169,7 @@ object GlassBridge {
         when (_mode.value) {
             CaptureMode.SHOT -> tapInShotMode()
             CaptureMode.STREAM -> tapInStreamMode()
+            CaptureMode.VOICE -> tapInVoiceMode()
         }
     }
 
@@ -179,9 +181,13 @@ object GlassBridge {
         if (_captureState.value == CaptureState.STREAMING) {
             stopStreaming("mode toggle")
         }
+        if (_captureState.value == CaptureState.RECORDING) {
+            stopRecording("mode toggle")
+        }
         _mode.value = when (_mode.value) {
             CaptureMode.SHOT -> CaptureMode.STREAM
-            CaptureMode.STREAM -> CaptureMode.SHOT
+            CaptureMode.STREAM -> CaptureMode.VOICE
+            CaptureMode.VOICE -> CaptureMode.SHOT
         }
         sendModeChange()
     }
@@ -216,6 +222,14 @@ object GlassBridge {
             CaptureState.IDLE -> startStreaming()
             CaptureState.STREAMING -> stopStreaming("user tap")
             else -> Log.d(TAG, "stream tap ignored (state=${_captureState.value})")
+        }
+    }
+
+    private fun tapInVoiceMode() {
+        when (_captureState.value) {
+            CaptureState.IDLE -> startRecording()
+            CaptureState.RECORDING -> stopRecording("user tap")
+            else -> Log.d(TAG, "voice tap ignored (state=${_captureState.value})")
         }
     }
 
@@ -334,6 +348,27 @@ object GlassBridge {
         scheduleResetTo(CaptureState.FAILED)
     }
 
+    // ---- voice ----
+    //
+    // VOICE mode is glass-led trigger but phone-driven capture: the glass app
+    // doesn't touch the microphone. It just sends voice_start/voice_end so
+    // phone can call cxrLink.startAudioStream / stopAudioStream and receive
+    // PCM via Hi Rokid's IAudioStreamCbk. Glass UI shows ● REC during the
+    // recording state.
+
+    private fun startRecording() {
+        cancelResultReset()
+        _captureState.value = CaptureState.RECORDING
+        sendEvent("voice_start")
+    }
+
+    private fun stopRecording(reason: String) {
+        if (_captureState.value != CaptureState.RECORDING) return
+        Log.d(TAG, "stopRecording: $reason")
+        sendEvent("voice_end")
+        _captureState.value = CaptureState.IDLE
+    }
+
     // ---- helpers ----
 
     private fun resetCapture(reason: String) {
@@ -341,6 +376,8 @@ object GlassBridge {
         cancelResultReset()
         GlassCamera.stopStream()
         stopSender()
+        // Voice has no glass-side stream to stop; phone observes session_close
+        // / disconnect via its own watchdog and stops its audio stream there.
         _captureState.value = CaptureState.IDLE
     }
 
@@ -395,7 +432,11 @@ object GlassBridge {
 
     private fun sendModeChange() {
         val b = bridge ?: return
-        val modeStr = if (_mode.value == CaptureMode.SHOT) "shot" else "stream"
+        val modeStr = when (_mode.value) {
+            CaptureMode.SHOT -> "shot"
+            CaptureMode.STREAM -> "stream"
+            CaptureMode.VOICE -> "voice"
+        }
         Log.d(TAG, "-> mode_change ($modeStr)")
         val caps = Caps().apply {
             write("event"); write("mode_change")

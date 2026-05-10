@@ -68,12 +68,13 @@ fun CaptureFx(state: CaptureState, mode: CaptureMode) {
         ModeBadge(
             mode = mode,
             streaming = state == CaptureState.STREAMING,
+            recording = state == CaptureState.RECORDING,
             modifier = Modifier
                 .align(Alignment.TopCenter)
                 .padding(top = 12.dp),
         )
 
-        if (state == CaptureState.STREAMING) {
+        if (state == CaptureState.STREAMING || state == CaptureState.RECORDING) {
             StopHint(
                 modifier = Modifier
                     .align(Alignment.BottomCenter)
@@ -136,8 +137,18 @@ fun CaptureFx(state: CaptureState, mode: CaptureMode) {
                     color = Color(0xFFCCCCCC),
                     fontSize = 32.sp,
                 )
+                state == CaptureState.IDLE && mode == CaptureMode.VOICE -> Text(
+                    text = "タップで録音",
+                    color = Color(0xFFCCCCCC),
+                    fontSize = 32.sp,
+                )
+                state == CaptureState.RECORDING -> RecText()
                 state == CaptureState.FAILED -> Text(
-                    text = if (mode == CaptureMode.STREAM) "ストリーム失敗" else "撮影失敗",
+                    text = when (mode) {
+                        CaptureMode.STREAM -> "ストリーム失敗"
+                        CaptureMode.VOICE -> "録音失敗"
+                        CaptureMode.SHOT -> "撮影失敗"
+                    },
                     color = Color(0xFFC04040),
                     fontSize = 32.sp,
                 )
@@ -148,20 +159,60 @@ fun CaptureFx(state: CaptureState, mode: CaptureMode) {
 }
 
 @Composable
-private fun ModeBadge(mode: CaptureMode, streaming: Boolean, modifier: Modifier = Modifier) {
+private fun ModeBadge(
+    mode: CaptureMode,
+    streaming: Boolean,
+    recording: Boolean,
+    modifier: Modifier = Modifier,
+) {
     Row(
         modifier = modifier,
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(6.dp),
     ) {
-        if (mode == CaptureMode.STREAM) {
-            LiveDot(active = streaming)
-        }
+        if (mode == CaptureMode.STREAM) LiveDot(active = streaming)
+        if (mode == CaptureMode.VOICE) LiveDot(active = recording)
         Text(
-            text = if (mode == CaptureMode.SHOT) "SHOT" else "STREAM",
+            text = when (mode) {
+                CaptureMode.SHOT -> "SHOT"
+                CaptureMode.STREAM -> "STREAM"
+                CaptureMode.VOICE -> "VOICE"
+            },
             color = Color(0xFF888888),
             fontSize = 12.sp,
             fontWeight = FontWeight.SemiBold,
+        )
+    }
+}
+
+@Composable
+private fun RecText() {
+    val transition = rememberInfiniteTransition(label = "rec-text")
+    val alpha by transition.animateFloat(
+        initialValue = 0.4f,
+        targetValue = 1f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(800, easing = FastOutSlowInEasing),
+            repeatMode = RepeatMode.Reverse,
+        ),
+        label = "rec-text-alpha",
+    )
+    Row(
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(10.dp),
+    ) {
+        Box(
+            modifier = Modifier
+                .size(14.dp)
+                .clip(CircleShape)
+                .background(LiveDotColor)
+                .alpha(alpha),
+        )
+        Text(
+            text = "REC",
+            color = Color(0xFFEEEEEE),
+            fontSize = 32.sp,
+            fontWeight = FontWeight.Bold,
         )
     }
 }

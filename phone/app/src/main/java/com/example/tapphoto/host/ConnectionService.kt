@@ -17,6 +17,7 @@ import androidx.compose.ui.graphics.asImageBitmap
 import androidx.core.app.NotificationCompat
 import com.example.cxrglobal.CXRLink
 import com.example.cxrglobal.CxrDefs
+import com.example.cxrglobal.callbacks.IAudioStreamCbk
 import com.example.cxrglobal.callbacks.ICXRLinkCbk
 import com.example.cxrglobal.callbacks.ICustomCmdCbk
 import com.example.cxrglobal.callbacks.IGlassAppCbk
@@ -45,7 +46,7 @@ private sealed class ViewState {
 }
 
 /** Capture mode mirrored from glass (driven by mode_change event). */
-enum class GlassMode { SHOT, STREAM }
+enum class GlassMode { SHOT, STREAM, VOICE }
 
 /**
  * Foreground service that holds the CXRL link and renders frames coming from
@@ -94,6 +95,12 @@ class ConnectionService : Service() {
         _running.value = false
         mainHandler.removeCallbacksAndMessages(null)
         sendCapsEvent("session_close")
+        // Stop any in-flight audio stream so the SDK doesn't keep pushing PCM
+        // to a callback whose VoiceRecorder file we're about to discard.
+        if (VoiceRecorder.recording.value) {
+            runCatching { cxrLink?.stopAudioStream() }
+            VoiceRecorder.stopRecording()
+        }
         runCatching { cxrLink?.disconnect() }
         cxrLink = null
         lConnected = false
@@ -139,6 +146,21 @@ class ConnectionService : Service() {
                     mainHandler.post { handleGlassMessage(event, caps) }
                 }
             })
+            // PCM arrives on a binder thread; VoiceRecorder writes are
+            // synchronized internally so we don't bounce back to mainHandler.
+            setCXRAudioCbk(object : IAudioStreamCbk {
+                override fun onAudioReceived(data: ByteArray, offset: Int, length: Int) {
+                    VoiceRecorder.onAudioChunk(data, offset, length)
+                }
+
+                override fun onAudioError(code: Int, msg: String?) {
+                    Log.w(TAG, "audio error code=$code msg=$msg")
+                }
+
+                override fun onAudioStreamStateChanged(started: Boolean) {
+                    Log.d(TAG, "audio stream state changed: started=$started")
+                }
+            })
             connect(token)
         }
     }
@@ -150,6 +172,8 @@ class ConnectionService : Service() {
             "frame" -> handleFrame(caps)
             "stream_start" -> handleStreamStart(caps)
             "stream_end" -> handleStreamEnd()
+            "voice_start" -> handleVoiceStart()
+            "voice_end" -> handleVoiceEnd()
             "mode_change" -> handleModeChange(caps)
             else -> Log.d(TAG, "ignore unknown glass event: $event")
         }
@@ -160,6 +184,7 @@ class ConnectionService : Service() {
         val mode = when (modeStr) {
             "shot" -> GlassMode.SHOT
             "stream" -> GlassMode.STREAM
+            "voice" -> GlassMode.VOICE
             else -> {
                 Log.w(TAG, "mode_change unknown mode=$modeStr")
                 return
@@ -177,8 +202,9 @@ class ConnectionService : Service() {
             FpsTracker.tick()
             StreamRecorder.add(frame)
         } else if (frame.kind == "shot") {
-            // a fresh shot supersedes any previously recorded stream buffer
+            // a fresh shot supersedes any previously recorded session content
             StreamRecorder.clear()
+            VoiceRecorder.clear()
         }
     }
 
@@ -189,6 +215,8 @@ class ConnectionService : Service() {
         _streaming.value = true
         FpsTracker.reset()
         StreamRecorder.startNewSession(periodMs)
+        // newer-wins: starting a stream supersedes any prior voice recording
+        VoiceRecorder.clear()
     }
 
     private fun handleStreamEnd() {
@@ -196,6 +224,30 @@ class ConnectionService : Service() {
         view = ViewState.Idle
         _streaming.value = false
         FpsTracker.reset()
+    }
+
+    private fun handleVoiceStart() {
+        val link = cxrLink ?: run {
+            Log.w(TAG, "voice_start ignored: cxrLink null")
+            return
+        }
+        Log.d(TAG, "<- voice_start")
+        // newer-wins: voice replaces any prior photo / stream content on the
+        // viewer side too — leaving the last shot bitmap up while recording
+        // is confusing.
+        StreamRecorder.clear()
+        PhotoStore.clear()
+        VoiceRecorder.startNewSession(applicationContext)
+        val ok = link.startAudioStream(1)
+        Log.d(TAG, "startAudioStream → $ok")
+    }
+
+    private fun handleVoiceEnd() {
+        val link = cxrLink
+        Log.d(TAG, "<- voice_end")
+        val ok = link?.stopAudioStream()
+        Log.d(TAG, "stopAudioStream → $ok")
+        VoiceRecorder.stopRecording()
     }
 
     // ---- helpers ----
