@@ -5,16 +5,17 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 
 /**
- * Buffers stream frames in memory while a stream is running. The user can save
- * the buffer to MP4 after the stream ends. Cleared on new stream start or on
- * explicit clear (e.g., after a successful save).
+ * Buffers video frames in memory while a VIDEO or MOVIE session is running.
+ * The user can save the buffer to MP4 after the session ends. Cleared on a
+ * new video session start or on explicit clear (e.g., after a successful
+ * save, or when a different session kind takes over).
  */
-object StreamRecorder {
+object VideoRecorder {
     private val frames = mutableListOf<GlassFrame>()
 
     @Volatile
     private var _periodMs: Long = 1000L
-    /** Capture period reported by glass at stream_start. Used by MediaSaver for gap-fill and playback FPS. */
+    /** Capture period reported by glass at capture_start. Used by MediaSaver for gap-fill and playback FPS. */
     val periodMs: Long get() = _periodMs
 
     private val _frameCount = MutableStateFlow(0)

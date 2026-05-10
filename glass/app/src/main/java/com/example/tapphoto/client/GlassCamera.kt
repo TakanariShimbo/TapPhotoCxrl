@@ -24,7 +24,7 @@ import androidx.core.content.ContextCompat
 import kotlin.math.abs
 
 private const val TAG = "GlassCamera"
-const val STREAM_FRAME_PERIOD_MS = 1000L  // tick-to-tick interval; independent of capture/send latency. Sent to phone in stream_start so playback period matches capture.
+const val CAMERA_FRAME_PERIOD_MS = 1000L  // tick-to-tick interval; independent of capture/send latency. Sent to phone in capture_start so playback period matches capture.
 private const val WARMUP_MS = 700L  // preview frames before first capture so AE/AWB can converge
 
 typealias FrameCallback = (jpeg: ByteArray, width: Int, height: Int, rotation: Int, captureTs: Long) -> Unit
@@ -35,8 +35,8 @@ typealias ErrorCallback = (reason: String) -> Unit
  * system photo overlay never shows up.
  *
  * Two entry points:
- *   - takeShot(...)   — single JPEG (one open/close cycle)
- *   - startStream(...) / stopStream() — repeating JPEGs until stopped
+ *   - takePhoto(...)         — single JPEG (one open/close cycle)
+ *   - startContinuous(...) / stopContinuous() — repeating JPEGs until stopped
  *
  * Only one operation runs at a time. Both deliver bytes via a callback that
  * also reports the frame's rotation (= camera SENSOR_ORIENTATION). The
@@ -44,7 +44,7 @@ typealias ErrorCallback = (reason: String) -> Unit
  */
 object GlassCamera {
 
-    private enum class Mode { IDLE, SHOT, STREAM }
+    private enum class Mode { IDLE, SINGLE, CONTINUOUS }
 
     private var thread: HandlerThread? = null
     private var handler: Handler? = null
@@ -60,20 +60,20 @@ object GlassCamera {
     private var sensorOrientation = 0
     private var onFrame: FrameCallback? = null
     private var onError: ErrorCallback? = null
-    private var nextStreamTickAt = 0L
+    private var nextTickAt = 0L
 
-    private val streamTickRunnable = object : Runnable {
+    private val tickRunnable = object : Runnable {
         override fun run() {
-            if (mode != Mode.STREAM) return
+            if (mode != Mode.CONTINUOUS) return
             capture()
             val now = SystemClock.uptimeMillis()
-            nextStreamTickAt += STREAM_FRAME_PERIOD_MS
-            if (nextStreamTickAt < now) nextStreamTickAt = now  // fast-forward if we fell behind
-            handler?.postAtTime(this, nextStreamTickAt)
+            nextTickAt += CAMERA_FRAME_PERIOD_MS
+            if (nextTickAt < now) nextTickAt = now  // fast-forward if we fell behind
+            handler?.postAtTime(this, nextTickAt)
         }
     }
 
-    fun takeShot(
+    fun takePhoto(
         ctx: Context,
         width: Int,
         height: Int,
@@ -81,11 +81,11 @@ object GlassCamera {
         onSuccess: FrameCallback,
         onError: ErrorCallback,
     ) {
-        if (!begin(ctx, Mode.SHOT, width, height, quality, onSuccess, onError)) return
+        if (!begin(ctx, Mode.SINGLE, width, height, quality, onSuccess, onError)) return
         handler!!.post { openCamera(ctx.applicationContext) }
     }
 
-    fun startStream(
+    fun startContinuous(
         ctx: Context,
         width: Int,
         height: Int,
@@ -93,13 +93,13 @@ object GlassCamera {
         onFrame: FrameCallback,
         onError: ErrorCallback,
     ) {
-        if (!begin(ctx, Mode.STREAM, width, height, quality, onFrame, onError)) return
+        if (!begin(ctx, Mode.CONTINUOUS, width, height, quality, onFrame, onError)) return
         handler!!.post { openCamera(ctx.applicationContext) }
     }
 
-    fun stopStream() {
-        if (mode != Mode.STREAM) return
-        Log.d(TAG, "stopStream requested")
+    fun stopContinuous() {
+        if (mode != Mode.CONTINUOUS) return
+        Log.d(TAG, "stopContinuous requested")
         val h = handler ?: return
         h.post { closeAll() }
     }
@@ -223,9 +223,9 @@ object GlassCamera {
                         handler?.postDelayed({
                             if (mode == Mode.IDLE) return@postDelayed
                             capture()
-                            if (mode == Mode.STREAM) {
-                                nextStreamTickAt = SystemClock.uptimeMillis() + STREAM_FRAME_PERIOD_MS
-                                handler?.postAtTime(streamTickRunnable, nextStreamTickAt)
+                            if (mode == Mode.CONTINUOUS) {
+                                nextTickAt = SystemClock.uptimeMillis() + CAMERA_FRAME_PERIOD_MS
+                                handler?.postAtTime(tickRunnable, nextTickAt)
                             }
                         }, WARMUP_MS)
                     }
@@ -276,9 +276,9 @@ object GlassCamera {
         ) {
             Log.w(TAG, "capture FAILED reason=${failure.reason}")
             when (mode) {
-                Mode.SHOT -> fail("capture-failed")
-                // STREAM: ticker keeps firing on its own; just log and wait for next tick.
-                Mode.STREAM -> Unit
+                Mode.SINGLE -> fail("capture-failed")
+                // CONTINUOUS: ticker keeps firing on its own; just log and wait for next tick.
+                Mode.CONTINUOUS -> Unit
                 Mode.IDLE -> Unit
             }
         }
@@ -310,13 +310,13 @@ object GlassCamera {
         // and detect drop-induced gaps.
         val captureTs = System.currentTimeMillis()
         when (mode) {
-            Mode.SHOT -> {
+            Mode.SINGLE -> {
                 val cb = onFrame
                 cb?.invoke(bytes, width, height, sensorOrientation, captureTs)
                 closeAll()
             }
-            Mode.STREAM -> {
-                // Just deliver the frame. The next capture is driven by streamTickRunnable
+            Mode.CONTINUOUS -> {
+                // Just deliver the frame. The next capture is driven by tickRunnable
                 // on a fixed period, independent of how long the consumer (BT send) takes.
                 onFrame?.invoke(bytes, width, height, sensorOrientation, captureTs)
             }
@@ -333,7 +333,7 @@ object GlassCamera {
 
     private fun closeAll() {
         mode = Mode.IDLE
-        handler?.removeCallbacks(streamTickRunnable)
+        handler?.removeCallbacks(tickRunnable)
         try { session?.stopRepeating() } catch (_: Throwable) {}
         try { session?.close() } catch (_: Throwable) {}
         try { device?.close() } catch (_: Throwable) {}

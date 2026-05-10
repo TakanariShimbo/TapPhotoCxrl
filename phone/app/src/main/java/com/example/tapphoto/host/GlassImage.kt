@@ -19,7 +19,7 @@ data class GlassFrame(
     val height: Int,
     val rotation: Int,
     val timestampMs: Long,
-    val kind: String,   // "shot" or "stream"
+    val kind: String,   // "photo" | "video" | "movie"
 )
 
 /**
@@ -27,7 +27,7 @@ data class GlassFrame(
  *
  * Wire format (Caps from glass):
  *   "event"  string  = "frame"
- *   "kind"   string  "shot" | "stream"
+ *   "kind"   string  "photo" | "video" | "movie"
  *   "w"      int32
  *   "h"      int32
  *   "rot"    int32   sensor orientation (degrees, clockwise)
@@ -47,7 +47,7 @@ object GlassImage {
             height = readInt32(caps, "h") ?: 0,
             rotation = readInt32(caps, "rot") ?: 0,
             timestampMs = readInt64(caps, "ts") ?: System.currentTimeMillis(),
-            kind = readString(caps, "kind") ?: "shot",
+            kind = readString(caps, "kind") ?: "photo",
         )
     }
 

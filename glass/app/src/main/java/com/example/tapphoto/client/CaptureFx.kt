@@ -60,26 +60,23 @@ private const val FLASH_PEAK_ALPHA = 0.45f
 
 @Composable
 fun CaptureFx(state: CaptureState, mode: CaptureMode) {
+    // Camera-related visuals (brackets) appear during PHOTO capture and during
+    // RUNNING when the mode uses the camera (VIDEO / MOVIE).
+    val cameraActive = state == CaptureState.RUNNING && mode.usesCameraVisual()
     val showBrackets = state == CaptureState.CAPTURING ||
         state == CaptureState.CAPTURED ||
-        state == CaptureState.STREAMING ||
-        state == CaptureState.FILMING
+        cameraActive
 
     Box(modifier = Modifier.fillMaxSize()) {
         ModeBadge(
             mode = mode,
-            streaming = state == CaptureState.STREAMING,
-            recording = state == CaptureState.RECORDING,
-            filming = state == CaptureState.FILMING,
+            running = state == CaptureState.RUNNING,
             modifier = Modifier
                 .align(Alignment.TopCenter)
                 .padding(top = 12.dp),
         )
 
-        if (state == CaptureState.STREAMING ||
-            state == CaptureState.RECORDING ||
-            state == CaptureState.FILMING
-        ) {
+        if (state == CaptureState.RUNNING) {
             StopHint(
                 modifier = Modifier
                     .align(Alignment.BottomCenter)
@@ -131,50 +128,50 @@ fun CaptureFx(state: CaptureState, mode: CaptureMode) {
                 )
             }
 
-            when {
-                state == CaptureState.IDLE && mode == CaptureMode.SHOT -> Text(
-                    text = "タップで撮影",
-                    color = Color(0xFFCCCCCC),
-                    fontSize = 32.sp,
-                )
-                state == CaptureState.IDLE && mode == CaptureMode.STREAM -> Text(
-                    text = "タップでストリーム",
-                    color = Color(0xFFCCCCCC),
-                    fontSize = 32.sp,
-                )
-                state == CaptureState.IDLE && mode == CaptureMode.VOICE -> Text(
-                    text = "タップで録音",
-                    color = Color(0xFFCCCCCC),
-                    fontSize = 32.sp,
-                )
-                state == CaptureState.IDLE && mode == CaptureMode.MOVIE -> Text(
-                    text = "タップで動画録画",
-                    color = Color(0xFFCCCCCC),
-                    fontSize = 32.sp,
-                )
-                state == CaptureState.RECORDING -> RecText()
-                state == CaptureState.FAILED -> Text(
-                    text = when (mode) {
-                        CaptureMode.STREAM -> "ストリーム失敗"
-                        CaptureMode.VOICE -> "録音失敗"
-                        CaptureMode.MOVIE -> "動画録画失敗"
-                        CaptureMode.SHOT -> "撮影失敗"
-                    },
-                    color = Color(0xFFC04040),
-                    fontSize = 32.sp,
-                )
-                else -> Unit
-            }
+            CenterText(state = state, mode = mode)
         }
     }
 }
 
 @Composable
+private fun CenterText(state: CaptureState, mode: CaptureMode) {
+    when {
+        state == CaptureState.IDLE -> Text(
+            text = mode.idlePrompt(),
+            color = Color(0xFFCCCCCC),
+            fontSize = 32.sp,
+        )
+        state == CaptureState.RUNNING && mode == CaptureMode.AUDIO -> RecText()
+        state == CaptureState.FAILED -> Text(
+            text = mode.failedLabel(),
+            color = Color(0xFFC04040),
+            fontSize = 32.sp,
+        )
+        else -> Unit
+    }
+}
+
+private fun CaptureMode.idlePrompt(): String = when (this) {
+    CaptureMode.PHOTO -> "タップで撮影"
+    CaptureMode.VIDEO -> "タップでビデオ"
+    CaptureMode.AUDIO -> "タップで録音"
+    CaptureMode.MOVIE -> "タップでムービー"
+}
+
+private fun CaptureMode.failedLabel(): String = when (this) {
+    CaptureMode.PHOTO -> "撮影失敗"
+    CaptureMode.VIDEO -> "ビデオ失敗"
+    CaptureMode.AUDIO -> "録音失敗"
+    CaptureMode.MOVIE -> "ムービー失敗"
+}
+
+private fun CaptureMode.usesCameraVisual(): Boolean =
+    this == CaptureMode.VIDEO || this == CaptureMode.MOVIE || this == CaptureMode.PHOTO
+
+@Composable
 private fun ModeBadge(
     mode: CaptureMode,
-    streaming: Boolean,
-    recording: Boolean,
-    filming: Boolean,
+    running: Boolean,
     modifier: Modifier = Modifier,
 ) {
     Row(
@@ -182,19 +179,9 @@ private fun ModeBadge(
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(6.dp),
     ) {
-        when (mode) {
-            CaptureMode.STREAM -> LiveDot(active = streaming)
-            CaptureMode.VOICE -> LiveDot(active = recording)
-            CaptureMode.MOVIE -> LiveDot(active = filming)
-            CaptureMode.SHOT -> Unit
-        }
+        if (mode != CaptureMode.PHOTO) LiveDot(active = running)
         Text(
-            text = when (mode) {
-                CaptureMode.SHOT -> "SHOT"
-                CaptureMode.STREAM -> "STREAM"
-                CaptureMode.VOICE -> "VOICE"
-                CaptureMode.MOVIE -> "MOVIE"
-            },
+            text = mode.name,  // "PHOTO" / "VIDEO" / "AUDIO" / "MOVIE"
             color = Color(0xFF888888),
             fontSize = 12.sp,
             fontWeight = FontWeight.SemiBold,

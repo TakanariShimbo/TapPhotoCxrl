@@ -19,9 +19,17 @@ private const val TAG = "MediaSaver"
 private const val SUBDIR = "TapPhotoCxrl"
 
 /**
- * Saves photos and stream videos to MediaStore (Pictures/{SUBDIR} and
- * Movies/{SUBDIR} respectively). Both methods are blocking I/O — call from
- * Dispatchers.IO.
+ * Save photo / video / audio / movie outputs to MediaStore. All methods are
+ * suspend and dispatch I/O internally — callers can invoke from a UI scope.
+ *
+ *   PHOTO  → Pictures/TapPhotoCxrl/<name>.jpg
+ *   VIDEO  → Movies/TapPhotoCxrl/<name>.mp4   (jcodec, gap-fill)
+ *   AUDIO  → Music/TapPhotoCxrl/<name>.wav    (raw PCM + RIFF header)
+ *   MOVIE  → Movies/TapPhotoCxrl/<name>.mp4   (video+AAC, mux)
+ *
+ * MediaStore boilerplate (insert → write → clear IS_PENDING) is centralized
+ * in [writeToMediaStore]; each public save method just provides the
+ * collection / mime / relative path and a write callback.
  */
 object MediaSaver {
 
@@ -29,46 +37,16 @@ object MediaSaver {
         ctx: Context,
         frame: GlassFrame,
         displayName: String,
-    ): Uri? = withContext(Dispatchers.IO) {
-        val resolver = ctx.contentResolver
-        val collection = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            MediaStore.Images.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY)
-        } else {
-            @Suppress("DEPRECATION")
-            MediaStore.Images.Media.EXTERNAL_CONTENT_URI
-        }
-        val values = ContentValues().apply {
-            put(MediaStore.Images.Media.DISPLAY_NAME, displayName)
-            put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg")
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                put(MediaStore.Images.Media.RELATIVE_PATH, "Pictures/$SUBDIR")
-                put(MediaStore.Images.Media.IS_PENDING, 1)
-            }
-        }
-        val uri = resolver.insert(collection, values) ?: run {
-            Log.w(TAG, "savePhoto: insert returned null")
-            return@withContext null
-        }
-        try {
-            // Re-encode the rotated bitmap so the saved JPEG is upright on any viewer.
-            val bitmap = GlassImage.decode(frame) ?: return@withContext null
-            resolver.openOutputStream(uri)?.use { out ->
-                bitmap.compress(android.graphics.Bitmap.CompressFormat.JPEG, 90, out)
-            } ?: run {
-                resolver.delete(uri, null, null)
-                return@withContext null
-            }
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                values.clear()
-                values.put(MediaStore.Images.Media.IS_PENDING, 0)
-                resolver.update(uri, values, null, null)
-            }
-            uri
-        } catch (t: Throwable) {
-            Log.w(TAG, "savePhoto failed", t)
-            runCatching { resolver.delete(uri, null, null) }
-            null
-        }
+    ): Uri? = writeToMediaStore(
+        ctx = ctx,
+        collection = imagesCollection(),
+        mime = "image/jpeg",
+        relativePath = "Pictures/$SUBDIR",
+        displayName = displayName,
+    ) { out ->
+        // Re-encode the rotated bitmap so the saved JPEG is upright on any viewer.
+        val bitmap = GlassImage.decode(frame) ?: error("decode failed")
+        bitmap.compress(android.graphics.Bitmap.CompressFormat.JPEG, 90, out)
     }
 
     suspend fun saveVideo(
@@ -81,47 +59,17 @@ object MediaSaver {
         val tempFile = File(ctx.cacheDir, "stream_encode_${System.currentTimeMillis()}.mp4")
         try {
             encodeMp4(frames, periodMs, tempFile)
-        } catch (t: Throwable) {
-            Log.w(TAG, "encodeMp4 failed", t)
-            tempFile.delete()
-            return@withContext null
-        }
-
-        val resolver = ctx.contentResolver
-        val collection = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            MediaStore.Video.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY)
-        } else {
-            @Suppress("DEPRECATION")
-            MediaStore.Video.Media.EXTERNAL_CONTENT_URI
-        }
-        val values = ContentValues().apply {
-            put(MediaStore.Video.Media.DISPLAY_NAME, displayName)
-            put(MediaStore.Video.Media.MIME_TYPE, "video/mp4")
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                put(MediaStore.Video.Media.RELATIVE_PATH, "Movies/$SUBDIR")
-                put(MediaStore.Video.Media.IS_PENDING, 1)
-            }
-        }
-        val uri = resolver.insert(collection, values) ?: run {
-            tempFile.delete()
-            return@withContext null
-        }
-        try {
-            resolver.openOutputStream(uri)?.use { out ->
+            writeToMediaStore(
+                ctx = ctx,
+                collection = videoCollection(),
+                mime = "video/mp4",
+                relativePath = "Movies/$SUBDIR",
+                displayName = displayName,
+            ) { out ->
                 tempFile.inputStream().use { it.copyTo(out) }
-            } ?: run {
-                resolver.delete(uri, null, null)
-                return@withContext null
             }
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                values.clear()
-                values.put(MediaStore.Video.Media.IS_PENDING, 0)
-                resolver.update(uri, values, null, null)
-            }
-            uri
         } catch (t: Throwable) {
-            Log.w(TAG, "saveVideo copy failed", t)
-            runCatching { resolver.delete(uri, null, null) }
+            Log.w(TAG, "saveVideo encode/copy failed", t)
             null
         } finally {
             tempFile.delete()
@@ -132,124 +80,136 @@ object MediaSaver {
         ctx: Context,
         frames: List<GlassFrame>,
         periodMs: Long,
-        voicePcm: VoiceSnapshot?,
+        audioPcm: AudioSnapshot?,
         displayName: String,
     ): Uri? = withContext(Dispatchers.IO) {
         if (frames.isEmpty()) return@withContext null
         val ts = System.currentTimeMillis()
         val tempVideo = File(ctx.cacheDir, "movie_video_$ts.mp4")
         val tempAudio = File(ctx.cacheDir, "movie_audio_$ts.mp4")
-        val tempFile = File(ctx.cacheDir, "movie_combined_$ts.mp4")
+        val tempCombined = File(ctx.cacheDir, "movie_combined_$ts.mp4")
         try {
-            // Step 1: video-only MP4 via the same jcodec path saveVideo uses
-            // (this is the path that already works for STREAM-only saves).
+            // Step 1: video-only MP4 (same jcodec path as saveVideo)
             encodeMp4(frames, periodMs, tempVideo)
-            val pcmReady = voicePcm != null && voicePcm.pcmFile.exists() && voicePcm.byteCount > 0L
-            if (pcmReady) {
-                // Step 2: PCM → AAC inside an MP4 container.
-                MovieEncoder.encodePcmToAacMp4(voicePcm!!.pcmFile, tempAudio)
-                // Step 3: copy both tracks into the final MP4 (no re-encode).
-                MovieEncoder.combineAvMp4(tempVideo, tempAudio, tempFile)
+            val pcmReady = audioPcm != null && audioPcm.pcmFile.exists() && audioPcm.byteCount > 0L
+            val finalFile = if (pcmReady) {
+                // Step 2: PCM → AAC inside an MP4 container
+                MovieEncoder.encodePcmToAacMp4(audioPcm!!.pcmFile, tempAudio)
+                // Step 3: copy both tracks into the final MP4 (no re-encode)
+                MovieEncoder.combineAvMp4(tempVideo, tempAudio, tempCombined)
+                tempCombined
             } else {
-                // Fall back to video-only if the audio side somehow has no PCM.
-                tempVideo.copyTo(tempFile, overwrite = true)
+                tempVideo
+            }
+            writeToMediaStore(
+                ctx = ctx,
+                collection = videoCollection(),
+                mime = "video/mp4",
+                relativePath = "Movies/$SUBDIR",
+                displayName = displayName,
+            ) { out ->
+                finalFile.inputStream().use { it.copyTo(out) }
             }
         } catch (t: Throwable) {
-            Log.w(TAG, "saveMovie encode failed", t)
-            tempVideo.delete(); tempAudio.delete(); tempFile.delete()
-            return@withContext null
-        }
-
-        val resolver = ctx.contentResolver
-        val collection = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            MediaStore.Video.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY)
-        } else {
-            @Suppress("DEPRECATION")
-            MediaStore.Video.Media.EXTERNAL_CONTENT_URI
-        }
-        val values = ContentValues().apply {
-            put(MediaStore.Video.Media.DISPLAY_NAME, displayName)
-            put(MediaStore.Video.Media.MIME_TYPE, "video/mp4")
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                put(MediaStore.Video.Media.RELATIVE_PATH, "Movies/$SUBDIR")
-                put(MediaStore.Video.Media.IS_PENDING, 1)
-            }
-        }
-        val uri = resolver.insert(collection, values) ?: run {
-            tempFile.delete()
-            return@withContext null
-        }
-        try {
-            resolver.openOutputStream(uri)?.use { out ->
-                tempFile.inputStream().use { it.copyTo(out) }
-            } ?: run {
-                resolver.delete(uri, null, null)
-                return@withContext null
-            }
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                values.clear()
-                values.put(MediaStore.Video.Media.IS_PENDING, 0)
-                resolver.update(uri, values, null, null)
-            }
-            uri
-        } catch (t: Throwable) {
-            Log.w(TAG, "saveMovie copy failed", t)
-            runCatching { resolver.delete(uri, null, null) }
+            Log.w(TAG, "saveMovie encode/copy failed", t)
             null
         } finally {
-            tempVideo.delete(); tempAudio.delete(); tempFile.delete()
+            tempVideo.delete(); tempAudio.delete(); tempCombined.delete()
         }
     }
 
     suspend fun saveAudio(
         ctx: Context,
-        snapshot: VoiceSnapshot,
+        snapshot: AudioSnapshot,
         displayName: String,
     ): Uri? = withContext(Dispatchers.IO) {
         if (!snapshot.pcmFile.exists() || snapshot.byteCount <= 0L) {
             Log.w(TAG, "saveAudio: empty pcm")
             return@withContext null
         }
-        val resolver = ctx.contentResolver
-        val collection = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            MediaStore.Audio.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY)
-        } else {
-            @Suppress("DEPRECATION")
-            MediaStore.Audio.Media.EXTERNAL_CONTENT_URI
+        writeToMediaStore(
+            ctx = ctx,
+            collection = audioCollection(),
+            mime = "audio/x-wav",
+            relativePath = "Music/$SUBDIR",
+            displayName = displayName,
+        ) { out ->
+            writePcmAsWav(out, snapshot.pcmFile, snapshot.byteCount)
         }
+    }
+
+    // ---- MediaStore boilerplate (shared) ----
+
+    /**
+     * Centralizes the insert → write → clear-pending dance. The [write]
+     * lambda runs with a freshly-opened OutputStream; throwing aborts the
+     * save and deletes the placeholder row.
+     */
+    private suspend fun writeToMediaStore(
+        ctx: Context,
+        collection: Uri,
+        mime: String,
+        relativePath: String,
+        displayName: String,
+        write: (OutputStream) -> Unit,
+    ): Uri? = withContext(Dispatchers.IO) {
+        val resolver = ctx.contentResolver
         val values = ContentValues().apply {
-            put(MediaStore.Audio.Media.DISPLAY_NAME, displayName)
-            put(MediaStore.Audio.Media.MIME_TYPE, "audio/x-wav")
+            put(MediaStore.MediaColumns.DISPLAY_NAME, displayName)
+            put(MediaStore.MediaColumns.MIME_TYPE, mime)
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                put(MediaStore.Audio.Media.RELATIVE_PATH, "Music/$SUBDIR")
-                put(MediaStore.Audio.Media.IS_PENDING, 1)
+                put(MediaStore.MediaColumns.RELATIVE_PATH, relativePath)
+                put(MediaStore.MediaColumns.IS_PENDING, 1)
             }
         }
         val uri = resolver.insert(collection, values) ?: run {
-            Log.w(TAG, "saveAudio: insert returned null")
+            Log.w(TAG, "writeToMediaStore: insert returned null name=$displayName")
             return@withContext null
         }
         try {
-            resolver.openOutputStream(uri)?.use { out ->
-                writePcmAsWav(out, snapshot.pcmFile, snapshot.byteCount)
-            } ?: run {
+            resolver.openOutputStream(uri)?.use(write) ?: run {
                 resolver.delete(uri, null, null)
                 return@withContext null
             }
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                 values.clear()
-                values.put(MediaStore.Audio.Media.IS_PENDING, 0)
+                values.put(MediaStore.MediaColumns.IS_PENDING, 0)
                 resolver.update(uri, values, null, null)
             }
             uri
         } catch (t: Throwable) {
-            Log.w(TAG, "saveAudio failed", t)
+            Log.w(TAG, "writeToMediaStore failed name=$displayName", t)
             runCatching { resolver.delete(uri, null, null) }
             null
         }
     }
 
-    /** Writes a 44-byte RIFF/WAVE header followed by the raw PCM bytes. */
+    private fun imagesCollection(): Uri =
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            MediaStore.Images.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY)
+        } else {
+            @Suppress("DEPRECATION")
+            MediaStore.Images.Media.EXTERNAL_CONTENT_URI
+        }
+
+    private fun videoCollection(): Uri =
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            MediaStore.Video.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY)
+        } else {
+            @Suppress("DEPRECATION")
+            MediaStore.Video.Media.EXTERNAL_CONTENT_URI
+        }
+
+    private fun audioCollection(): Uri =
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            MediaStore.Audio.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY)
+        } else {
+            @Suppress("DEPRECATION")
+            MediaStore.Audio.Media.EXTERNAL_CONTENT_URI
+        }
+
+    // ---- WAV (PCM passthrough) ----
+
     private fun writePcmAsWav(out: OutputStream, pcm: File, pcmSize: Long) {
         val sampleRate = 16_000
         val channels: Short = 1
@@ -268,17 +228,15 @@ object MediaSaver {
     ): ByteArray {
         val totalDataLen = totalAudioLen + 36
         val h = ByteArray(44)
-        // "RIFF" + size + "WAVE"
         h[0] = 'R'.code.toByte(); h[1] = 'I'.code.toByte(); h[2] = 'F'.code.toByte(); h[3] = 'F'.code.toByte()
         h[4] = (totalDataLen and 0xff).toByte()
         h[5] = ((totalDataLen shr 8) and 0xff).toByte()
         h[6] = ((totalDataLen shr 16) and 0xff).toByte()
         h[7] = ((totalDataLen shr 24) and 0xff).toByte()
         h[8] = 'W'.code.toByte(); h[9] = 'A'.code.toByte(); h[10] = 'V'.code.toByte(); h[11] = 'E'.code.toByte()
-        // "fmt " subchunk
         h[12] = 'f'.code.toByte(); h[13] = 'm'.code.toByte(); h[14] = 't'.code.toByte(); h[15] = ' '.code.toByte()
-        h[16] = 16; h[17] = 0; h[18] = 0; h[19] = 0          // subchunk size = 16 (PCM)
-        h[20] = 1; h[21] = 0                                  // audio format = 1 (PCM)
+        h[16] = 16; h[17] = 0; h[18] = 0; h[19] = 0
+        h[20] = 1; h[21] = 0
         h[22] = channels.toByte(); h[23] = 0
         h[24] = (sampleRate and 0xff).toByte()
         h[25] = ((sampleRate shr 8) and 0xff).toByte()
@@ -291,7 +249,6 @@ object MediaSaver {
         h[32] = ((channels * bitsPerSample / 8) and 0xff).toByte()
         h[33] = 0
         h[34] = bitsPerSample.toByte(); h[35] = 0
-        // "data" subchunk
         h[36] = 'd'.code.toByte(); h[37] = 'a'.code.toByte(); h[38] = 't'.code.toByte(); h[39] = 'a'.code.toByte()
         h[40] = (totalAudioLen and 0xff).toByte()
         h[41] = ((totalAudioLen shr 8) and 0xff).toByte()
@@ -300,12 +257,14 @@ object MediaSaver {
         return h
     }
 
+    // ---- video-only MP4 (jcodec) — used by VIDEO directly and by MOVIE step 1 ----
+
     private fun encodeMp4(frames: List<GlassFrame>, periodMs: Long, outputFile: File) {
         // Glass only sends frames it managed to push over BT; drops appear as
         // gaps in the timestamp sequence. Hold the previous frame across each
         // gap so playback runs at real time and "freezes" on dropped regions
         // instead of speeding up. periodMs is the glass-side capture period
-        // (received in stream_start) — authoritative, not estimated.
+        // (received in capture_start) — authoritative, not estimated.
         val period = periodMs.coerceAtLeast(1L)
         val expanded = expandWithGapFill(frames, period)
         val fps = computePlaybackFps(period)

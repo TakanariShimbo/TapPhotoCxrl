@@ -4,6 +4,7 @@ import android.Manifest
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.util.Log
@@ -121,10 +122,10 @@ fun MainScreen(
     val latestFrame by PhotoStore.latestFrame.collectAsState()
     val fps by FpsTracker.fps.collectAsState()
     val glassMode by ConnectionService.glassMode.collectAsState()
-    val streaming by ConnectionService.streaming.collectAsState()
-    val streamFrameCount by StreamRecorder.frameCount.collectAsState()
-    val voiceRecording by VoiceRecorder.recording.collectAsState()
-    val voiceHasContent by VoiceRecorder.hasContent.collectAsState()
+    val videoActive by ConnectionService.videoActive.collectAsState()
+    val videoFrameCount by VideoRecorder.frameCount.collectAsState()
+    val audioRecording by AudioRecorder.recording.collectAsState()
+    val audioHasContent by AudioRecorder.hasContent.collectAsState()
     val scope = rememberCoroutineScope()
 
     val notifPermLauncher = rememberLauncherForActivityResult(
@@ -174,100 +175,110 @@ fun MainScreen(
             fps = fps,
             onClear = PhotoStore::clear,
         )
-        SaveButton(
-            streaming = streaming,
-            recording = voiceRecording,
-            videoFrameCount = streamFrameCount,
-            hasVoice = voiceHasContent,
+        val saveOption = computeSaveOption(
+            videoActive = videoActive,
+            audioRecording = audioRecording,
+            videoFrameCount = videoFrameCount,
+            hasAudio = audioHasContent,
             hasPhoto = latestFrame != null,
+        )
+        SaveButton(
+            option = saveOption,
             onSave = {
-                val hasVideoBuffer = streamFrameCount > 0 && !streaming
-                val hasVoiceBuffer = voiceHasContent && !voiceRecording
-                when {
-                    // MOVIE = video frames + voice from the same session
-                    hasVideoBuffer && hasVoiceBuffer -> {
-                        val frames = StreamRecorder.snapshot()
-                        val voiceSnap = VoiceRecorder.snapshot()
-                        if (frames.isEmpty() || voiceSnap == null) return@SaveButton
-                        scope.launch {
-                            val name = "tapphoto_${fileFmt.format(Date())}.mp4"
-                            Toast.makeText(context, "エンコード中…", Toast.LENGTH_SHORT).show()
-                            val uri = MediaSaver.saveMovie(context, frames, StreamRecorder.periodMs, voiceSnap, name)
-                            Toast.makeText(
-                                context,
-                                if (uri != null) "保存しました: Movies/TapPhotoCxrl/$name" else "保存に失敗",
-                                Toast.LENGTH_LONG,
-                            ).show()
-                        }
+                val opt = saveOption ?: return@SaveButton
+                scope.launch {
+                    val name = "tapphoto_${fileFmt.format(Date())}.${opt.ext}"
+                    if (opt.ext == "mp4") {
+                        Toast.makeText(context, "エンコード中…", Toast.LENGTH_SHORT).show()
                     }
-                    hasVideoBuffer -> {
-                        val frames = StreamRecorder.snapshot()
-                        if (frames.isEmpty()) return@SaveButton
-                        scope.launch {
-                            val name = "tapphoto_${fileFmt.format(Date())}.mp4"
-                            Toast.makeText(context, "エンコード中…", Toast.LENGTH_SHORT).show()
-                            val uri = MediaSaver.saveVideo(context, frames, StreamRecorder.periodMs, name)
-                            Toast.makeText(
-                                context,
-                                if (uri != null) "保存しました: Movies/TapPhotoCxrl/$name" else "保存に失敗",
-                                Toast.LENGTH_LONG,
-                            ).show()
-                        }
-                    }
-                    hasVoiceBuffer -> {
-                        val snap = VoiceRecorder.snapshot() ?: return@SaveButton
-                        scope.launch {
-                            val name = "tapphoto_${fileFmt.format(Date())}.wav"
-                            val uri = MediaSaver.saveAudio(context, snap, name)
-                            Toast.makeText(
-                                context,
-                                if (uri != null) "保存しました: Music/TapPhotoCxrl/$name" else "保存に失敗",
-                                Toast.LENGTH_LONG,
-                            ).show()
-                        }
-                    }
-                    else -> {
-                        val frame = latestFrame ?: return@SaveButton
-                        scope.launch {
-                            val name = "tapphoto_${fileFmt.format(Date())}.jpg"
-                            val uri = MediaSaver.savePhoto(context, frame, name)
-                            Toast.makeText(
-                                context,
-                                if (uri != null) "保存しました: Pictures/TapPhotoCxrl/$name" else "保存に失敗",
-                                Toast.LENGTH_SHORT,
-                            ).show()
-                        }
-                    }
+                    val uri = opt.save(context, name)
+                    Toast.makeText(
+                        context,
+                        if (uri != null) "保存しました: ${opt.dest}/$name" else "保存に失敗",
+                        Toast.LENGTH_LONG,
+                    ).show()
                 }
             },
         )
     }
 }
 
+/**
+ * What the save button currently maps to. Resolved from the recorders' state
+ * via [computeSaveOption]; null = nothing saveable, button disabled.
+ *
+ * Priority MOVIE > VIDEO > AUDIO > PHOTO matches the "richest current
+ * session" — newer-wins on the recorder side ensures only one kind has
+ * content at a time except for MOVIE (video + audio together).
+ */
+private data class SaveOption(
+    val label: String,
+    val ext: String,
+    val dest: String,
+    val save: suspend (Context, String) -> Uri?,
+)
+
+private fun computeSaveOption(
+    videoActive: Boolean,
+    audioRecording: Boolean,
+    videoFrameCount: Int,
+    hasAudio: Boolean,
+    hasPhoto: Boolean,
+): SaveOption? {
+    if (videoActive || audioRecording) return null
+    val hasVideo = videoFrameCount > 0
+    return when {
+        hasVideo && hasAudio -> SaveOption(
+            label = "保存 (動画+音声)",
+            ext = "mp4",
+            dest = "Movies/TapPhotoCxrl",
+        ) { ctx, name ->
+            val frames = VideoRecorder.snapshot()
+            val audio = AudioRecorder.snapshot()
+            if (frames.isEmpty() || audio == null) null
+            else MediaSaver.saveMovie(ctx, frames, VideoRecorder.periodMs, audio, name)
+        }
+        hasVideo -> SaveOption(
+            label = "保存 (動画)",
+            ext = "mp4",
+            dest = "Movies/TapPhotoCxrl",
+        ) { ctx, name ->
+            val frames = VideoRecorder.snapshot()
+            if (frames.isEmpty()) null
+            else MediaSaver.saveVideo(ctx, frames, VideoRecorder.periodMs, name)
+        }
+        hasAudio -> SaveOption(
+            label = "保存 (音声)",
+            ext = "wav",
+            dest = "Music/TapPhotoCxrl",
+        ) { ctx, name ->
+            val audio = AudioRecorder.snapshot()
+            if (audio == null) null
+            else MediaSaver.saveAudio(ctx, audio, name)
+        }
+        hasPhoto -> SaveOption(
+            label = "保存 (写真)",
+            ext = "jpg",
+            dest = "Pictures/TapPhotoCxrl",
+        ) { ctx, name ->
+            val frame = PhotoStore.latestFrame.value
+            if (frame == null) null
+            else MediaSaver.savePhoto(ctx, frame, name)
+        }
+        else -> null
+    }
+}
+
 @Composable
 private fun SaveButton(
-    streaming: Boolean,
-    recording: Boolean,
-    videoFrameCount: Int,
-    hasVoice: Boolean,
-    hasPhoto: Boolean,
+    option: SaveOption?,
     onSave: () -> Unit,
 ) {
-    val asVideo = videoFrameCount > 0 && !streaming
-    val asAudio = hasVoice && !recording
-    val asMovie = asVideo && asAudio
-    val busy = streaming || recording
-    val enabled = !busy && (asMovie || asVideo || asAudio || hasPhoto)
-    val label = when {
-        busy -> "保存"
-        asMovie -> "保存 (動画+音声)"
-        asVideo -> "保存 (動画)"
-        asAudio -> "保存 (音声)"
-        hasPhoto -> "保存 (写真)"
-        else -> "保存"
-    }
     Row {
-        FilledTonalButton(onClick = onSave, enabled = enabled) { Text(label) }
+        FilledTonalButton(
+            onClick = onSave,
+            enabled = option != null,
+        ) { Text(option?.label ?: "保存") }
     }
 }
 

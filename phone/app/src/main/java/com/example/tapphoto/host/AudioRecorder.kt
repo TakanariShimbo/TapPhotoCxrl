@@ -8,23 +8,23 @@ import kotlinx.coroutines.flow.asStateFlow
 import java.io.File
 import java.io.FileOutputStream
 
-private const val TAG = "VoiceRecorder"
-private const val PCM_FILE_PREFIX = "voice_"
+private const val TAG = "AudioRecorder"
+private const val PCM_FILE_PREFIX = "audio_"
 private const val PCM_FILE_EXT = ".pcm"
 
 /**
- * Buffers an in-progress voice recording. Audio bytes (16 kHz mono 16-bit
+ * Buffers an in-progress audio recording. Audio bytes (16 kHz mono 16-bit
  * signed PCM) arrive on the binder thread from Hi Rokid via IAudioStreamCbk
  * and are written incrementally to a temp file in cacheDir — keeping memory
  * flat regardless of recording length. On stop the file is left in place so
  * the user can hit Save (which converts PCM → WAV via MediaSaver).
  *
- * Lifecycle is mostly mirrored from StreamRecorder but with a single PCM
- * stream instead of a frame list.
+ * Lifecycle is parallel to VideoRecorder but stores a single PCM stream
+ * instead of a frame list.
  */
-data class VoiceSnapshot(val pcmFile: File, val byteCount: Long)
+data class AudioSnapshot(val pcmFile: File, val byteCount: Long)
 
-object VoiceRecorder {
+object AudioRecorder {
     private val lock = Any()
     private var pcmFile: File? = null
     private var pcmStream: FileOutputStream? = null
@@ -86,10 +86,10 @@ object VoiceRecorder {
         }
     }
 
-    fun snapshot(): VoiceSnapshot? = synchronized(lock) {
+    fun snapshot(): AudioSnapshot? = synchronized(lock) {
         val file = pcmFile ?: return null
         if (!file.exists() || byteCount <= 0L) return null
-        VoiceSnapshot(file, byteCount)
+        AudioSnapshot(file, byteCount)
     }
 
     fun clear() {

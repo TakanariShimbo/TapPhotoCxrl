@@ -22,13 +22,13 @@ private const val PCM_READ_CHUNK = 4_096
 private const val SAMPLE_BUFFER_BYTES = 1024 * 1024
 
 /**
- * MOVIE save helpers. Approach: make a video-only MP4 (jcodec, see
- * [MediaSaver.encodeMp4Video]) + an audio-only MP4 (AAC) here, then mux the
- * tracks of those two files into a single MP4 with MediaExtractor +
- * MediaMuxer. Doing the video and audio passes independently sidesteps the
- * encoder-color-format / stride pitfalls of feeding MediaCodec H.264 with
- * raw bitmaps directly — both proven paths (jcodec for video, MediaCodec for
- * AAC) are kept untouched.
+ * MOVIE save helpers. Approach: make a video-only MP4 with jcodec
+ * (`MediaSaver` does this internally for VIDEO mode too) + an audio-only MP4
+ * (AAC) here, then mux the tracks of those two files into a single MP4 with
+ * MediaExtractor + MediaMuxer. Doing the video and audio passes
+ * independently sidesteps the encoder-color-format / stride pitfalls of
+ * feeding MediaCodec H.264 with raw bitmaps directly — both proven paths
+ * (jcodec for video, MediaCodec for AAC) are kept untouched.
  */
 object MovieEncoder {
 

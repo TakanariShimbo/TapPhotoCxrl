@@ -101,23 +101,23 @@ fun CaptureScreen(
 @Preview(showBackground = true, backgroundColor = 0xFF000000, widthDp = 480, heightDp = 270)
 @Composable
 private fun IdlePreview() {
-    CaptureScreen(BridgeStatus.CONNECTED, sessionOpen = true, captureState = CaptureState.IDLE, mode = CaptureMode.SHOT)
+    CaptureScreen(BridgeStatus.CONNECTED, sessionOpen = true, captureState = CaptureState.IDLE, mode = CaptureMode.PHOTO)
 }
 
 @Preview(showBackground = true, backgroundColor = 0xFF000000, widthDp = 480, heightDp = 270)
 @Composable
 private fun CapturingPreview() {
-    CaptureScreen(BridgeStatus.CONNECTED, sessionOpen = true, captureState = CaptureState.CAPTURING, mode = CaptureMode.SHOT)
+    CaptureScreen(BridgeStatus.CONNECTED, sessionOpen = true, captureState = CaptureState.CAPTURING, mode = CaptureMode.PHOTO)
 }
 
 @Preview(showBackground = true, backgroundColor = 0xFF000000, widthDp = 480, heightDp = 270)
 @Composable
 private fun CapturedPreview() {
-    CaptureScreen(BridgeStatus.CONNECTED, sessionOpen = true, captureState = CaptureState.CAPTURED, mode = CaptureMode.SHOT)
+    CaptureScreen(BridgeStatus.CONNECTED, sessionOpen = true, captureState = CaptureState.CAPTURED, mode = CaptureMode.PHOTO)
 }
 
 @Preview(showBackground = true, backgroundColor = 0xFF000000, widthDp = 480, heightDp = 270)
 @Composable
 private fun DisconnectedPreview() {
-    CaptureScreen(BridgeStatus.DISCONNECTED, sessionOpen = false, captureState = CaptureState.IDLE, mode = CaptureMode.SHOT)
+    CaptureScreen(BridgeStatus.DISCONNECTED, sessionOpen = false, captureState = CaptureState.IDLE, mode = CaptureMode.PHOTO)
 }
