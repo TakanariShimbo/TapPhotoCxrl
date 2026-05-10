@@ -12,13 +12,19 @@ import kotlinx.coroutines.flow.asStateFlow
 object StreamRecorder {
     private val frames = mutableListOf<GlassFrame>()
 
+    @Volatile
+    private var _periodMs: Long = 1000L
+    /** Capture period reported by glass at stream_start. Used by MediaSaver for gap-fill and playback FPS. */
+    val periodMs: Long get() = _periodMs
+
     private val _frameCount = MutableStateFlow(0)
     val frameCount: StateFlow<Int> = _frameCount.asStateFlow()
 
-    fun startNewSession() {
+    fun startNewSession(periodMs: Long) {
         synchronized(frames) {
             frames.clear()
             _frameCount.value = 0
+            _periodMs = periodMs
         }
     }
 

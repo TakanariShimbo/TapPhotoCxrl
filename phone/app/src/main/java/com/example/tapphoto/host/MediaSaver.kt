@@ -72,12 +72,13 @@ object MediaSaver {
     suspend fun saveVideo(
         ctx: Context,
         frames: List<GlassFrame>,
+        periodMs: Long,
         displayName: String,
     ): Uri? = withContext(Dispatchers.IO) {
         if (frames.isEmpty()) return@withContext null
         val tempFile = File(ctx.cacheDir, "stream_encode_${System.currentTimeMillis()}.mp4")
         try {
-            encodeMp4(frames, tempFile)
+            encodeMp4(frames, periodMs, tempFile)
         } catch (t: Throwable) {
             Log.w(TAG, "encodeMp4 failed", t)
             tempFile.delete()
@@ -125,20 +126,37 @@ object MediaSaver {
         }
     }
 
-    private fun encodeMp4(frames: List<GlassFrame>, outputFile: File) {
-        val fps = computePlaybackFps(frames)
-        Log.d(TAG, "encodeMp4 frames=${frames.size} fps=${fps.num}/${fps.den}")
+    private fun encodeMp4(frames: List<GlassFrame>, periodMs: Long, outputFile: File) {
+        // Glass only sends frames it managed to push over BT; drops appear as
+        // gaps in the timestamp sequence. Hold the previous frame across each
+        // gap so playback runs at real time and "freezes" on dropped regions
+        // instead of speeding up. periodMs is the glass-side capture period
+        // (received in stream_start) — authoritative, not estimated.
+        val period = periodMs.coerceAtLeast(1L)
+        val expanded = expandWithGapFill(frames, period)
+        val fps = computePlaybackFps(period)
+        Log.d(TAG, "encodeMp4 origFrames=${frames.size} expanded=${expanded.size} period=${period}ms fps=${fps.num}/${fps.den}")
         val out = NIOUtils.writableChannel(outputFile)
         try {
             val encoder = AndroidSequenceEncoder(out, fps)
-            for (frame in frames) {
-                val bitmap = GlassImage.decode(frame) ?: continue
-                // H.264 requires even dimensions — pad if odd by cropping by 1 pixel.
-                val even = ensureEvenDimensions(bitmap)
+            // Decode each unique frame once; reuse for duplicates that fill gaps.
+            var lastJpeg: ByteArray? = null
+            var lastBitmap: android.graphics.Bitmap? = null
+            for (frame in expanded) {
+                val bmp = if (frame.jpeg === lastJpeg && lastBitmap != null && !lastBitmap.isRecycled) {
+                    lastBitmap
+                } else {
+                    lastBitmap?.recycle()
+                    val decoded = GlassImage.decode(frame) ?: continue
+                    lastJpeg = frame.jpeg
+                    lastBitmap = decoded
+                    decoded
+                }
+                val even = ensureEvenDimensions(bmp)
                 encoder.encodeImage(even)
-                if (even !== bitmap) bitmap.recycle()
-                even.recycle()
+                if (even !== bmp) even.recycle()
             }
+            lastBitmap?.recycle()
             encoder.finish()
         } finally {
             NIOUtils.closeQuietly(out)
@@ -146,18 +164,33 @@ object MediaSaver {
     }
 
     /**
-     * Average capture rate over the recorded frame timestamps. Uses fixed-rate
-     * playback at this average so the resulting video runs at real time
-     * (within transmission jitter). Returned as Rational.R(fps * 100, 100) for
-     * sub-fps precision; coerced to 0.5–60 fps.
+     * Where consecutive timestamps are >1.5× the period apart, repeat the
+     * previous frame to fill. Each duplicate keeps the original `jpeg`
+     * reference so the encoder can avoid re-decoding (see encodeMp4).
      */
-    private fun computePlaybackFps(frames: List<GlassFrame>): Rational {
-        if (frames.size < 2) return Rational.R(1, 1)
-        val durationMs = frames.last().timestampMs - frames.first().timestampMs
-        if (durationMs <= 0) return Rational.R(1, 1)
-        val fpsX100 = ((frames.size - 1) * 100_000L / durationMs)
-            .toInt()
-            .coerceIn(50, 6000)
+    private fun expandWithGapFill(frames: List<GlassFrame>, periodMs: Long): List<GlassFrame> {
+        if (frames.size < 2) return frames
+        val threshold = (periodMs * 3) / 2
+        val out = ArrayList<GlassFrame>(frames.size)
+        for (i in frames.indices) {
+            out.add(frames[i])
+            if (i == frames.size - 1) continue
+            val actualGap = frames[i + 1].timestampMs - frames[i].timestampMs
+            if (actualGap > threshold) {
+                val nFill = ((actualGap / periodMs) - 1).toInt().coerceAtLeast(0)
+                repeat(nFill) { out.add(frames[i]) }
+            }
+        }
+        return out
+    }
+
+    /**
+     * Playback FPS = 1000 / periodMs (clamped). After expandWithGapFill the
+     * frame list is uniform at periodMs intervals, so encoding at this rate
+     * yields real-time playback.
+     */
+    private fun computePlaybackFps(periodMs: Long): Rational {
+        val fpsX100 = (100_000L / periodMs).toInt().coerceIn(50, 6000)
         return Rational.R(fpsX100, 100)
     }
 

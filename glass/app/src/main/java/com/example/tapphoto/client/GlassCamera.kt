@@ -16,6 +16,7 @@ import android.hardware.camera2.TotalCaptureResult
 import android.media.ImageReader
 import android.os.Handler
 import android.os.HandlerThread
+import android.os.SystemClock
 import android.util.Log
 import android.util.Size
 import android.view.Surface
@@ -23,10 +24,10 @@ import androidx.core.content.ContextCompat
 import kotlin.math.abs
 
 private const val TAG = "GlassCamera"
-private const val STREAM_FRAME_GAP_MS = 250L
+const val STREAM_FRAME_PERIOD_MS = 1000L  // tick-to-tick interval; independent of capture/send latency. Sent to phone in stream_start so playback period matches capture.
 private const val WARMUP_MS = 700L  // preview frames before first capture so AE/AWB can converge
 
-typealias FrameCallback = (jpeg: ByteArray, width: Int, height: Int, rotation: Int) -> Unit
+typealias FrameCallback = (jpeg: ByteArray, width: Int, height: Int, rotation: Int, captureTs: Long) -> Unit
 typealias ErrorCallback = (reason: String) -> Unit
 
 /**
@@ -59,6 +60,18 @@ object GlassCamera {
     private var sensorOrientation = 0
     private var onFrame: FrameCallback? = null
     private var onError: ErrorCallback? = null
+    private var nextStreamTickAt = 0L
+
+    private val streamTickRunnable = object : Runnable {
+        override fun run() {
+            if (mode != Mode.STREAM) return
+            capture()
+            val now = SystemClock.uptimeMillis()
+            nextStreamTickAt += STREAM_FRAME_PERIOD_MS
+            if (nextStreamTickAt < now) nextStreamTickAt = now  // fast-forward if we fell behind
+            handler?.postAtTime(this, nextStreamTickAt)
+        }
+    }
 
     fun takeShot(
         ctx: Context,
@@ -208,7 +221,12 @@ object GlassCamera {
                         // Let AE/AWB settle on preview frames before the first
                         // still capture so the first JPEG isn't off-color.
                         handler?.postDelayed({
-                            if (mode != Mode.IDLE) capture()
+                            if (mode == Mode.IDLE) return@postDelayed
+                            capture()
+                            if (mode == Mode.STREAM) {
+                                nextStreamTickAt = SystemClock.uptimeMillis() + STREAM_FRAME_PERIOD_MS
+                                handler?.postAtTime(streamTickRunnable, nextStreamTickAt)
+                            }
                         }, WARMUP_MS)
                     }
 
@@ -259,7 +277,8 @@ object GlassCamera {
             Log.w(TAG, "capture FAILED reason=${failure.reason}")
             when (mode) {
                 Mode.SHOT -> fail("capture-failed")
-                Mode.STREAM -> handler?.postDelayed({ if (mode == Mode.STREAM) capture() }, STREAM_FRAME_GAP_MS)
+                // STREAM: ticker keeps firing on its own; just log and wait for next tick.
+                Mode.STREAM -> Unit
                 Mode.IDLE -> Unit
             }
         }
@@ -286,15 +305,20 @@ object GlassCamera {
     }
 
     private fun onImageBytes(bytes: ByteArray) {
+        // Capture timestamp as close to actual frame creation as we can see
+        // from the API surface. Phone uses this to place frames on a timeline
+        // and detect drop-induced gaps.
+        val captureTs = System.currentTimeMillis()
         when (mode) {
             Mode.SHOT -> {
                 val cb = onFrame
-                cb?.invoke(bytes, width, height, sensorOrientation)
+                cb?.invoke(bytes, width, height, sensorOrientation, captureTs)
                 closeAll()
             }
             Mode.STREAM -> {
-                onFrame?.invoke(bytes, width, height, sensorOrientation)
-                handler?.postDelayed({ if (mode == Mode.STREAM) capture() }, STREAM_FRAME_GAP_MS)
+                // Just deliver the frame. The next capture is driven by streamTickRunnable
+                // on a fixed period, independent of how long the consumer (BT send) takes.
+                onFrame?.invoke(bytes, width, height, sensorOrientation, captureTs)
             }
             Mode.IDLE -> Unit
         }
@@ -309,6 +333,7 @@ object GlassCamera {
 
     private fun closeAll() {
         mode = Mode.IDLE
+        handler?.removeCallbacks(streamTickRunnable)
         try { session?.stopRepeating() } catch (_: Throwable) {}
         try { session?.close() } catch (_: Throwable) {}
         try { device?.close() } catch (_: Throwable) {}

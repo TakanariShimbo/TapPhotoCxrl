@@ -5,10 +5,10 @@
 ## このプロジェクトの狙い
 
 - **SHOT モード**: グラスでタップ → グラス側 Camera2 で 1024×768 を 1 枚撮影 → JPEG をスマホへ送って最新 1 枚として表示
-- **STREAM モード**: グラスでタップで開始/停止 → グラス側 Camera2 で 480×360 を連続キャプチャ → スマホでライブプレビュー (fps 表示付き)
+- **STREAM モード**: グラスでタップで開始/停止 → グラス側 Camera2 で 480×360 を **固定周期** で連続キャプチャ → スマホでライブプレビュー (fps 表示付き)
 - **モード切替**: グラスで前後スワイプ (DPAD_LEFT / DPAD_RIGHT) → SHOT ⇄ STREAM
 - グラス側は HUD として **緑のコーナーブラケット → 白フラッシュ → ✓** のキャプチャ演出 + シャッター音 + 上端にモードバッジ (`SHOT` / `● STREAM`)
-- スマホ側は **最新 1 枚** だけを保持 (履歴やストレージ書き出しはなし)
+- スマホ側は最新 1 枚を表示しつつ、**保存ボタン**でストレージに書き出し (SHOT は JPEG / STREAM は MP4 として MediaStore へ。STREAM 動画は撮影時刻ベースで gap-fill)
 
 撮影パイプラインは `GlassCamera` (`glass/.../client/GlassCamera.kt`) に閉じ込めてあり、API は `takeShot(...)` / `startStream(...)` + `stopStream()` の 2 系統だけ。Hi Rokid `takePhoto()` の代替として使える。
 
@@ -75,13 +75,14 @@ CAPTURED / FAILED は **2 秒後に IDLE 復帰**。STREAMING は次のタップ
 
 ブラケット / ✓ / フラッシュ / モードバッジ は画像アセットを使わず Compose `Canvas` の `Path` で描画。シャッター音は `ToneGenerator` の合成音 (アセット同梱なし)。
 
-撮影パイプライン (`GlassCamera`):
+撮影パイプライン (`GlassCamera` + `GlassBridge`):
 
 1. `CameraDevice.openCamera` → `CameraCaptureSession` を `[previewSurface, jpegReader.surface]` 2 面で構成
 2. `TEMPLATE_PREVIEW` を repeating で流して AE/AWB を収束させる (起動直後のみ **700ms warmup**)
-3. `TEMPLATE_STILL_CAPTURE` を 1 ショット投げる → `ImageReader.OnImageAvailableListener` で JPEG bytes を取得
-4. STREAM では 3 を `STREAM_FRAME_GAP_MS` (250ms) ごとに繰り返す。SHOT は 1 回だけ
-5. 取得した JPEG は **回転を適用せず**、Caps に `rot = SENSOR_ORIENTATION` を載せて送信 (回転はスマホ側で実施)
+3. `TEMPLATE_STILL_CAPTURE` を 1 ショット投げる → `ImageReader.OnImageAvailableListener` で JPEG bytes と **撮影時刻** を取得
+4. SHOT は 3 を 1 回だけ。STREAM は **撮影スレッド** (`glass-camera`) が `STREAM_FRAME_PERIOD_MS` (1000ms) の **固定周期** で 3 を打ち続ける (送信時間に引きずられない)
+5. STREAM の送信は別スレッド (`glass-bt-sender`) で動き、producer↔consumer 間は **容量 1 の slot** (`AtomicReference`)。送信が周期に追いつかなければ古いキューが新フレームに上書きされる (`queued frame skipped` ログ)。撮影時刻は wire の `ts` に載るので、phone は drop 区間を timestamp で検出できる
+6. 取得した JPEG は **回転を適用せず**、Caps に `rot = SENSOR_ORIENTATION` を載せて送信 (回転はスマホ側で実施)
 
 ### スマホ側
 - Hi Rokid 認証 → token を `EncryptedSharedPreferences` に永続化
@@ -91,10 +92,11 @@ CAPTURED / FAILED は **2 秒後に IDLE 復帰**。STREAMING は次のタップ
   - 通常: 「最新の写真 (HH:mm:ss)」
   - STREAM 中: 「**ライブ映像 (X.X fps)**」 — `FpsTracker` がローリング平均で算出
 - グラスからのイベント別動作:
-  - `frame{kind=shot, w, h, rot, data}` → `GlassImage.decodeFrame` で回転込み Bitmap → `PhotoStore`
-  - `frame{kind=stream, ...}` → 同上 + `FpsTracker.tick`
-  - `stream_start` → 内部状態 `Streaming` へ。FpsTracker reset
+  - `frame{kind=shot, w, h, rot, ts, data}` → `GlassImage.decodeFrame` で回転込み Bitmap → `PhotoStore`
+  - `frame{kind=stream, ...}` → 同上 + `FpsTracker.tick` + `StreamRecorder.add` (mp4 化用に蓄積)
+  - `stream_start{period_ms}` → 内部状態 `Streaming` へ。`StreamRecorder.startNewSession(period_ms)` で受信周期を保持
   - `stream_end` → 内部状態 `Idle` へ
+- 保存ボタン: STREAM 蓄積があれば mp4、無ければ最新 1 枚を JPEG として MediaStore (`Pictures/TapPhotoCxrl` / `Movies/TapPhotoCxrl`) に書き出す。mp4 エンコードは jcodec で、各フレームの撮影 `ts` から **1.5×period 以上の隙間** を検出すると前フレームを複製で穴埋めし、playback FPS = `1000/period_ms` で実時間再生になるよう揃える
 - スマホ→グラスの送信は `session_open` / `ping` / `session_close` のみ (撮影トリガは glass-local)
 
 ## アーキテクチャ
@@ -139,7 +141,7 @@ HelloToggleCxrl と同じ application-level セッションを継承。
 | チャンネル | 方向 | `event` の取りうる値 |
 |---|---|---|
 | `rk_custom_client` | phone → glass | `session_open` / `session_close` / `ping` |
-| `rk_custom_key` | glass → phone | `frame` (binary 画像) / `stream_start` / `stream_end` |
+| `rk_custom_key` | glass → phone | `frame` (binary 画像) / `stream_start` / `stream_end` / `mode_change` |
 
 ペイロードは `com.rokid.cxr.Caps` を positional で書き込み (キー文字列とその値が交互に並ぶ)。共通フィールド:
 
@@ -148,7 +150,7 @@ write("event"), write(<event>)
 write("ts"),    writeInt64(<epoch ms>)
 ```
 
-`frame` イベントだけ追加フィールドあり:
+`frame` の追加フィールド (`ts` は **撮影時刻** = ImageReader callback 時点):
 
 ```
 write("kind"), write("shot" | "stream")
@@ -156,6 +158,12 @@ write("w"),    writeInt32(<width>)
 write("h"),    writeInt32(<height>)
 write("rot"),  writeInt32(<degrees, 通常 SENSOR_ORIENTATION>)
 write("data"), write(<JPEG bytes>)         // TYPE_BINARY
+```
+
+`stream_start` の追加フィールド (撮影周期。phone はこれを動画 playback FPS と gap-fill 閾値に使う):
+
+```
+write("period_ms"), writeInt64(<glass の STREAM_FRAME_PERIOD_MS>)
 ```
 
 > JPEG は Caps の binary フィールドに直接埋め込んで送る。`CXRServiceBridge.sendMessage(String, Caps, byte[])` の別 byte 引数経路は phone 側 (CXR-L) から拾えないため、Caps 内 binary に統一している。1024×768 q=80 で約 50KB / 480×360 q=50 で約 5KB の payload で動作確認済み。
@@ -244,9 +252,11 @@ private const val STREAM_QUALITY = 50
 ### Camera2 ループ (`glass/app/src/main/java/com/example/tapphoto/client/GlassCamera.kt`)
 
 ```kotlin
-private const val STREAM_FRAME_GAP_MS = 250L   // 連続キャプチャ間隔 (実 fps はカメラ側律速とのminで決まる)
+const val STREAM_FRAME_PERIOD_MS = 1000L       // STREAM 撮影の固定周期 (= 期待 fps の逆数)。stream_start で phone へ通知される
 private const val WARMUP_MS = 700L             // preview 開始から初回キャプチャまで
 ```
+
+`STREAM_FRAME_PERIOD_MS` を縮めると fps は上がるが BT 送信や JPEG エンコードがメモリ圧迫源になり LMK で殺されやすくなる (Rokid Glass の RAM 余裕は薄い)。1000ms 以上が安定動作の目安。
 
 `WARMUP_MS` は AE / AWB が収束する時間。短くすると初回フレームの色味が崩れる。
 
@@ -271,14 +281,16 @@ private const val FLASH_PEAK_ALPHA = 0.45f           // フラッシュ最大不
 - **Hi Rokid 行が `not installed`**: グローバル版 (`com.rokid.sprite.global.aiapp`) がインストールされていない、または `phone/app/src/main/AndroidManifest.xml` の `<queries>` 漏れ
 - **タップしても何も起きない / カメラが開かない**: glass の CAMERA 権限未付与。`adb shell pm grant com.example.tapphoto.client android.permission.CAMERA` で明示付与
 - **ストリームの 1 枚目だけ色味がおかしい**: `WARMUP_MS` が短すぎる可能性。`GlassCamera.kt` で値を上げて再ビルド
-- **STREAM 中のスマホ側 fps が出ない / 1 fps 未満**: glass 側 capture が律速。`STREAM_QUALITY` / 解像度を下げる
+- **STREAM 中のスマホ側 fps が期待値 (1000/`STREAM_FRAME_PERIOD_MS`) より低い**: BT が周期に追いついていない可能性。glass logcat で `queued frame skipped` が出ていれば skip 発生。`STREAM_QUALITY` / 解像度を下げるか、`STREAM_FRAME_PERIOD_MS` を伸ばす
+- **STREAM 中にグラスアプリが落ちる**: メモリ圧迫で LMK が刈っている可能性。`STREAM_FRAME_PERIOD_MS` を伸ばすか、解像度・JPEG 品質を下げる
 - **グラス側が `Phone not connected` のまま**: phone 側 Foreground Service が起動していない、または phone がサイレント kill された。スマホで `[接続開始]` を押し直す
 - **ビルド時に `Could not resolve com.example.cxrglobal:lib`**: CxrGlobal リポを並列に clone していない、または `phone/settings.gradle.kts` の `includeBuild` パスが合っていない
 
 ## 既知の制限
 
-- 履歴 / ストレージ書き出しなし (最新 1 枚のみメモリ保持。アプリ kill で消える)
+- ストレージ書き出しは保存ボタン押下時のみ。STREAM フレームのバッファはアプリ kill / セッション再開で消える (永続化なし)
 - BT 物理切断 → 復帰時の自動再接続なし (手動で `[接続停止]` → `[接続開始]`)
 - token 期限切れの自動検出なし
 - グラス用 APK の自動デプロイは未実装 (手動 `adb install` 想定)
 - glass 側 Camera2 でカメラを掴んでいる間 Hi Rokid 純正のカメラ機能 (シャッターボタン撮影など) と競合する可能性 (現状未確認)
+- STREAM の BT スループット上限 ≒ 1 fps (Rokid Glass + 480×360 JPEG で安定動作する設定)。それより高い fps は LMK 殺しに当たりやすい

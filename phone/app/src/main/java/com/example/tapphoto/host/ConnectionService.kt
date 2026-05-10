@@ -148,7 +148,7 @@ class ConnectionService : Service() {
     private fun handleGlassMessage(event: String, caps: Caps) {
         when (event) {
             "frame" -> handleFrame(caps)
-            "stream_start" -> handleStreamStart()
+            "stream_start" -> handleStreamStart(caps)
             "stream_end" -> handleStreamEnd()
             "mode_change" -> handleModeChange(caps)
             else -> Log.d(TAG, "ignore unknown glass event: $event")
@@ -182,12 +182,13 @@ class ConnectionService : Service() {
         }
     }
 
-    private fun handleStreamStart() {
-        Log.d(TAG, "<- stream_start (was=$view)")
+    private fun handleStreamStart(caps: Caps) {
+        val periodMs = readInt64(caps, "period_ms") ?: 1000L
+        Log.d(TAG, "<- stream_start period_ms=$periodMs (was=$view)")
         view = ViewState.Streaming
         _streaming.value = true
         FpsTracker.reset()
-        StreamRecorder.startNewSession()
+        StreamRecorder.startNewSession(periodMs)
     }
 
     private fun handleStreamEnd() {
@@ -207,6 +208,19 @@ class ConnectionService : Service() {
             if (key.type() == Caps.Value.TYPE_STRING && key.string == fieldName) {
                 val v = caps.at(i + 1)
                 if (v.type() == Caps.Value.TYPE_STRING) return@runCatching v.string
+            }
+        }
+        null
+    }.getOrNull()
+
+    private fun readInt64(caps: Caps, fieldName: String): Long? = runCatching {
+        for (i in 0 until caps.size() - 1) {
+            val key = caps.at(i)
+            if (key.type() == Caps.Value.TYPE_STRING && key.string == fieldName) {
+                val v = caps.at(i + 1)
+                if (v.type() == Caps.Value.TYPE_INT64 || v.type() == Caps.Value.TYPE_UINT64) {
+                    return@runCatching v.long
+                }
             }
         }
         null

@@ -183,7 +183,7 @@ fun MainScreen(
                     scope.launch {
                         val name = "tapphoto_${fileFmt.format(Date())}.mp4"
                         Toast.makeText(context, "エンコード中…", Toast.LENGTH_SHORT).show()
-                        val uri = MediaSaver.saveVideo(context, frames, name)
+                        val uri = MediaSaver.saveVideo(context, frames, StreamRecorder.periodMs, name)
                         Toast.makeText(
                             context,
                             if (uri != null) "保存しました: Movies/TapPhotoCxrl/$name" else "保存に失敗",
@@ -218,7 +218,7 @@ private fun SaveButton(
     val enabled = !streaming && (asVideo || hasPhoto)
     val label = when {
         streaming -> "保存"
-        asVideo -> "保存 (動画 $videoFrameCount frames)"
+        asVideo -> "保存 (動画)"
         hasPhoto -> "保存 (写真)"
         else -> "保存"
     }

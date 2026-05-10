@@ -2,10 +2,13 @@ package com.example.tapphoto.client
 
 import android.content.Context
 import android.os.Handler
+import android.os.HandlerThread
 import android.os.Looper
+import android.os.SystemClock
 import android.util.Log
 import com.rokid.cxr.CXRServiceBridge
 import com.rokid.cxr.Caps
+import java.util.concurrent.atomic.AtomicReference
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -65,6 +68,28 @@ object GlassBridge {
     val mode: StateFlow<CaptureMode> = _mode.asStateFlow()
 
     private val mainHandler = Handler(Looper.getMainLooper())
+
+    // Stream send pipeline: camera (producer) → senderHandler (consumer).
+    // Capture period is fixed by GlassCamera; sending is decoupled here so
+    // BT send time doesn't drag the capture cadence.
+    //
+    // Buffering = "in-flight 1 + queued slot 1". Producer puts the latest frame
+    // into `streamSlot`; if a queued frame was already there it's overwritten
+    // (newer wins) and logged as "skipped". Consumer drains the slot, sends,
+    // then re-checks. Each frame carries its own captureTs so phone can place
+    // frames on a timeline and gap-fill on video assembly.
+    private var senderThread: HandlerThread? = null
+    private var senderHandler: Handler? = null
+    private val streamSlot = AtomicReference<StreamFrame?>(null)
+    private var lastFrameProducedAt = 0L
+
+    private data class StreamFrame(
+        val jpeg: ByteArray,
+        val w: Int,
+        val h: Int,
+        val rot: Int,
+        val captureTs: Long,
+    )
     private val pingTimeoutRunnable = Runnable {
         Log.d(TAG, "ping timeout")
         _sessionOpen.value = false
@@ -177,8 +202,8 @@ object GlassBridge {
             width = SHOT_TARGET_W,
             height = SHOT_TARGET_H,
             quality = SHOT_QUALITY,
-            onSuccess = { jpeg, w, h, rot ->
-                mainHandler.post { onShotCaptured(jpeg, w, h, rot) }
+            onSuccess = { jpeg, w, h, rot, captureTs ->
+                mainHandler.post { onShotCaptured(jpeg, w, h, rot, captureTs) }
             },
             onError = { reason ->
                 mainHandler.post { onShotFailed(reason) }
@@ -196,12 +221,12 @@ object GlassBridge {
 
     // ---- shot ----
 
-    private fun onShotCaptured(jpeg: ByteArray, w: Int, h: Int, rot: Int) {
+    private fun onShotCaptured(jpeg: ByteArray, w: Int, h: Int, rot: Int, captureTs: Long) {
         if (_captureState.value != CaptureState.CAPTURING) {
             Log.w(TAG, "shot result in unexpected state=${_captureState.value} (dropped)")
             return
         }
-        val sent = sendFrame(FRAME_KIND_SHOT, jpeg, w, h, rot)
+        val sent = sendFrame(FRAME_KIND_SHOT, jpeg, w, h, rot, captureTs)
         if (sent) {
             CameraSfx.playShutter()
             scheduleResetTo(CaptureState.CAPTURED)
@@ -227,17 +252,67 @@ object GlassBridge {
         }
         cancelResultReset()
         _captureState.value = CaptureState.STREAMING
-        sendEvent("stream_start")
+        sendStreamStart()
+        startSender()
         GlassCamera.startStream(
             ctx = ctx,
             width = STREAM_TARGET_W,
             height = STREAM_TARGET_H,
             quality = STREAM_QUALITY,
-            onFrame = { jpeg, w, h, rot -> sendFrame(FRAME_KIND_STREAM, jpeg, w, h, rot) },
+            onFrame = ::onStreamFrameProduced,
             onError = { reason ->
                 mainHandler.post { onStreamFailed(reason) }
             },
         )
+    }
+
+    private fun onStreamFrameProduced(jpeg: ByteArray, w: Int, h: Int, rot: Int, captureTs: Long) {
+        val now = SystemClock.uptimeMillis()
+        val gap = if (lastFrameProducedAt > 0L) now - lastFrameProducedAt else 0L
+        lastFrameProducedAt = now
+
+        val incoming = StreamFrame(jpeg, w, h, rot, captureTs)
+        // Newer wins: overwrite the queued slot. If something was already there
+        // (= consumer was busy with the previous in-flight send AND a queued
+        // frame existed waiting), we just discarded a frame the receiver will
+        // never see. Phone fills these gaps via captureTs on assembly.
+        val replaced = streamSlot.getAndSet(incoming)
+        if (replaced != null) {
+            Log.w(TAG, "queued frame skipped: newer overwrote (gap=${gap}ms oldSize=${replaced.jpeg.size} newSize=${jpeg.size})")
+        }
+        senderHandler?.post(::drainSlotOnce)
+    }
+
+    /**
+     * Sender-side drain. Posted by producer for every new frame. Multiple
+     * pending posts are harmless — whoever runs while the slot has content
+     * sends it; later runs that find an empty slot are no-ops.
+     */
+    private fun drainSlotOnce() {
+        val f = streamSlot.getAndSet(null) ?: return
+        val t0 = SystemClock.uptimeMillis()
+        val ok = try {
+            sendFrame(FRAME_KIND_STREAM, f.jpeg, f.w, f.h, f.rot, f.captureTs)
+        } catch (t: Throwable) {
+            Log.w(TAG, "stream sendFrame threw", t); false
+        }
+        Log.d(TAG, "stream send: send=${SystemClock.uptimeMillis() - t0}ms ok=$ok size=${f.jpeg.size}")
+    }
+
+    private fun startSender() {
+        if (senderThread != null) return
+        senderThread = HandlerThread("glass-bt-sender").also { it.start() }
+        senderHandler = Handler(senderThread!!.looper)
+        streamSlot.set(null)
+        lastFrameProducedAt = 0L
+    }
+
+    private fun stopSender() {
+        senderThread?.quitSafely()
+        senderThread = null
+        senderHandler = null
+        streamSlot.set(null)
+        lastFrameProducedAt = 0L
     }
 
     private fun stopStreaming(reason: String) {
@@ -245,6 +320,7 @@ object GlassBridge {
         Log.d(TAG, "stopStreaming: $reason")
         GlassCamera.stopStream()
         sendEvent("stream_end")
+        stopSender()
         _captureState.value = CaptureState.IDLE
     }
 
@@ -253,6 +329,7 @@ object GlassBridge {
         if (_captureState.value != CaptureState.STREAMING) return
         GlassCamera.stopStream()
         sendEvent("stream_end")
+        stopSender()
         CameraSfx.playFail()
         scheduleResetTo(CaptureState.FAILED)
     }
@@ -263,6 +340,7 @@ object GlassBridge {
         Log.d(TAG, "resetCapture: $reason (was ${_captureState.value})")
         cancelResultReset()
         GlassCamera.stopStream()
+        stopSender()
         _captureState.value = CaptureState.IDLE
     }
 
@@ -300,6 +378,21 @@ object GlassBridge {
             .onFailure { Log.w(TAG, "sendMessage($event) failed", it) }
     }
 
+    private fun sendStreamStart() {
+        val b = bridge ?: run {
+            Log.w(TAG, "sendStreamStart dropped: bridge null")
+            return
+        }
+        Log.d(TAG, "-> stream_start period_ms=$STREAM_FRAME_PERIOD_MS")
+        val caps = Caps().apply {
+            write("event"); write("stream_start")
+            write("ts"); writeInt64(System.currentTimeMillis())
+            write("period_ms"); writeInt64(STREAM_FRAME_PERIOD_MS)
+        }
+        runCatching { b.sendMessage(CHANNEL_TO_PHONE, caps) }
+            .onFailure { Log.w(TAG, "sendMessage(stream_start) failed", it) }
+    }
+
     private fun sendModeChange() {
         val b = bridge ?: return
         val modeStr = if (_mode.value == CaptureMode.SHOT) "shot" else "stream"
@@ -313,7 +406,7 @@ object GlassBridge {
             .onFailure { Log.w(TAG, "sendModeChange failed", it) }
     }
 
-    private fun sendFrame(kind: String, jpeg: ByteArray, w: Int, h: Int, rot: Int): Boolean {
+    private fun sendFrame(kind: String, jpeg: ByteArray, w: Int, h: Int, rot: Int, captureTs: Long): Boolean {
         val b = bridge ?: return false
         val caps = Caps().apply {
             write("event"); write("frame")
@@ -321,7 +414,7 @@ object GlassBridge {
             write("w"); writeInt32(w)
             write("h"); writeInt32(h)
             write("rot"); writeInt32(rot)
-            write("ts"); writeInt64(System.currentTimeMillis())
+            write("ts"); writeInt64(captureTs)  // capture time, not send time
             write("data"); write(jpeg)
         }
         val result = runCatching { b.sendMessage(CHANNEL_TO_PHONE, caps) }
