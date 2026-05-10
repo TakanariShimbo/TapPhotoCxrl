@@ -31,6 +31,9 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
+import android.widget.Toast
+import kotlinx.coroutines.launch
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.ImageBitmap
@@ -47,6 +50,7 @@ import java.util.Date
 import java.util.Locale
 
 private val timeFmt = SimpleDateFormat("HH:mm:ss", Locale.US)
+private val fileFmt = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US)
 private const val HI_ROKID_PKG = "com.rokid.sprite.global.aiapp"
 
 private fun isPackageInstalled(context: Context, pkg: String): Boolean =
@@ -114,8 +118,12 @@ fun MainScreen(
     }
     val photo by PhotoStore.latest.collectAsState()
     val capturedAt by PhotoStore.capturedAt.collectAsState()
+    val latestFrame by PhotoStore.latestFrame.collectAsState()
     val fps by FpsTracker.fps.collectAsState()
     val glassMode by ConnectionService.glassMode.collectAsState()
+    val streaming by ConnectionService.streaming.collectAsState()
+    val streamFrameCount by StreamRecorder.frameCount.collectAsState()
+    val scope = rememberCoroutineScope()
 
     val notifPermLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestPermission(),
@@ -164,6 +172,58 @@ fun MainScreen(
             fps = fps,
             onClear = PhotoStore::clear,
         )
+        SaveButton(
+            streaming = streaming,
+            videoFrameCount = streamFrameCount,
+            hasPhoto = latestFrame != null,
+            onSave = {
+                if (streamFrameCount > 0 && !streaming) {
+                    val frames = StreamRecorder.snapshot()
+                    if (frames.isEmpty()) return@SaveButton
+                    scope.launch {
+                        val name = "tapphoto_${fileFmt.format(Date())}.mp4"
+                        Toast.makeText(context, "エンコード中…", Toast.LENGTH_SHORT).show()
+                        val uri = MediaSaver.saveVideo(context, frames, name)
+                        Toast.makeText(
+                            context,
+                            if (uri != null) "保存しました: Movies/TapPhotoCxrl/$name" else "保存に失敗",
+                            Toast.LENGTH_LONG,
+                        ).show()
+                    }
+                } else {
+                    val frame = latestFrame ?: return@SaveButton
+                    scope.launch {
+                        val name = "tapphoto_${fileFmt.format(Date())}.jpg"
+                        val uri = MediaSaver.savePhoto(context, frame, name)
+                        Toast.makeText(
+                            context,
+                            if (uri != null) "保存しました: Pictures/TapPhotoCxrl/$name" else "保存に失敗",
+                            Toast.LENGTH_SHORT,
+                        ).show()
+                    }
+                }
+            },
+        )
+    }
+}
+
+@Composable
+private fun SaveButton(
+    streaming: Boolean,
+    videoFrameCount: Int,
+    hasPhoto: Boolean,
+    onSave: () -> Unit,
+) {
+    val asVideo = videoFrameCount > 0 && !streaming
+    val enabled = !streaming && (asVideo || hasPhoto)
+    val label = when {
+        streaming -> "保存"
+        asVideo -> "保存 (動画 $videoFrameCount frames)"
+        hasPhoto -> "保存 (写真)"
+        else -> "保存"
+    }
+    Row {
+        FilledTonalButton(onClick = onSave, enabled = enabled) { Text(label) }
     }
 }
 

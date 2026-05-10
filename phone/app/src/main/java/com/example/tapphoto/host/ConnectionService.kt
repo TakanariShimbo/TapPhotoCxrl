@@ -170,20 +170,30 @@ class ConnectionService : Service() {
     }
 
     private fun handleFrame(caps: Caps) {
-        val bitmap = GlassImage.decodeFrame(caps) ?: return
-        PhotoStore.set(bitmap.asImageBitmap())
-        if (view is ViewState.Streaming) FpsTracker.tick()
+        val frame = GlassImage.parse(caps) ?: return
+        val bitmap = GlassImage.decode(frame) ?: return
+        PhotoStore.set(bitmap.asImageBitmap(), frame)
+        if (view is ViewState.Streaming) {
+            FpsTracker.tick()
+            StreamRecorder.add(frame)
+        } else if (frame.kind == "shot") {
+            // a fresh shot supersedes any previously recorded stream buffer
+            StreamRecorder.clear()
+        }
     }
 
     private fun handleStreamStart() {
         Log.d(TAG, "<- stream_start (was=$view)")
         view = ViewState.Streaming
+        _streaming.value = true
         FpsTracker.reset()
+        StreamRecorder.startNewSession()
     }
 
     private fun handleStreamEnd() {
         Log.d(TAG, "<- stream_end (was=$view)")
         view = ViewState.Idle
+        _streaming.value = false
         FpsTracker.reset()
     }
 
@@ -216,6 +226,7 @@ class ConnectionService : Service() {
         if (state != CxrConnState.CONNECTED && view is ViewState.Streaming) {
             Log.d(TAG, "disconnect: clearing Streaming view state")
             view = ViewState.Idle
+            _streaming.value = false
             FpsTracker.reset()
         }
         if (state == CxrConnState.CONNECTED && !appStarted) {
@@ -308,6 +319,9 @@ class ConnectionService : Service() {
 
         private val _glassMode = MutableStateFlow(GlassMode.SHOT)
         val glassMode: StateFlow<GlassMode> = _glassMode.asStateFlow()
+
+        private val _streaming = MutableStateFlow(false)
+        val streaming: StateFlow<Boolean> = _streaming.asStateFlow()
 
         fun start(context: Context) {
             val intent = Intent(context, ConnectionService::class.java)

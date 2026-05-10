@@ -52,6 +52,8 @@ dependencies {
     // Borrow Caps serializer from the original Rokid SDK (wire-compatible with the glass side).
     implementation("com.rokid.cxr:client-l:1.0.1")
     implementation("androidx.security:security-crypto:1.1.0-alpha06")
+    implementation("org.jcodec:jcodec:0.2.5")
+    implementation("org.jcodec:jcodec-android:0.2.5")
     testImplementation(libs.junit)
     androidTestImplementation(platform(libs.androidx.compose.bom))
     androidTestImplementation(libs.androidx.compose.ui.test.junit4)
