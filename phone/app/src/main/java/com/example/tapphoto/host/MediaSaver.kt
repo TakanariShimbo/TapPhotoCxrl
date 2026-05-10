@@ -2,15 +2,13 @@ package com.example.tapphoto.host
 
 import android.content.ContentValues
 import android.content.Context
+import android.graphics.Bitmap
 import android.net.Uri
 import android.os.Build
 import android.provider.MediaStore
 import android.util.Log
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
-import org.jcodec.api.android.AndroidSequenceEncoder
-import org.jcodec.common.io.NIOUtils
-import org.jcodec.common.model.Rational
 import java.io.File
 import java.io.FileInputStream
 import java.io.OutputStream
@@ -27,9 +25,8 @@ private const val SUBDIR = "TapPhotoCxrl"
  *   AUDIO  → Music/TapPhotoCxrl/<name>.wav    (raw PCM + RIFF header)
  *   MOVIE  → Movies/TapPhotoCxrl/<name>.mp4   (video+AAC, mux)
  *
- * MediaStore boilerplate (insert → write → clear IS_PENDING) is centralized
- * in [writeToMediaStore]; each public save method just provides the
- * collection / mime / relative path and a write callback.
+ * Encoding lives in [MediaEncoder]; this object handles only MediaStore
+ * boilerplate and the WAV header.
  */
 object MediaSaver {
 
@@ -46,7 +43,7 @@ object MediaSaver {
     ) { out ->
         // Re-encode the rotated bitmap so the saved JPEG is upright on any viewer.
         val bitmap = GlassImage.decode(frame) ?: error("decode failed")
-        bitmap.compress(android.graphics.Bitmap.CompressFormat.JPEG, 90, out)
+        bitmap.compress(Bitmap.CompressFormat.JPEG, 90, out)
     }
 
     suspend fun saveVideo(
@@ -58,7 +55,7 @@ object MediaSaver {
         if (frames.isEmpty()) return@withContext null
         val tempFile = File(ctx.cacheDir, "stream_encode_${System.currentTimeMillis()}.mp4")
         try {
-            encodeMp4(frames, periodMs, tempFile)
+            MediaEncoder.encodeVideoMp4(frames, periodMs, tempFile)
             writeToMediaStore(
                 ctx = ctx,
                 collection = videoCollection(),
@@ -89,14 +86,11 @@ object MediaSaver {
         val tempAudio = File(ctx.cacheDir, "movie_audio_$ts.mp4")
         val tempCombined = File(ctx.cacheDir, "movie_combined_$ts.mp4")
         try {
-            // Step 1: video-only MP4 (same jcodec path as saveVideo)
-            encodeMp4(frames, periodMs, tempVideo)
+            MediaEncoder.encodeVideoMp4(frames, periodMs, tempVideo)
             val pcmReady = audioPcm != null && audioPcm.pcmFile.exists() && audioPcm.byteCount > 0L
             val finalFile = if (pcmReady) {
-                // Step 2: PCM → AAC inside an MP4 container
-                MovieEncoder.encodePcmToAacMp4(audioPcm!!.pcmFile, tempAudio)
-                // Step 3: copy both tracks into the final MP4 (no re-encode)
-                MovieEncoder.combineAvMp4(tempVideo, tempAudio, tempCombined)
+                MediaEncoder.encodePcmToAacMp4(audioPcm!!.pcmFile, tempAudio)
+                MediaEncoder.combineAvMp4(tempVideo, tempAudio, tempCombined)
                 tempCombined
             } else {
                 tempVideo
@@ -255,82 +249,5 @@ object MediaSaver {
         h[42] = ((totalAudioLen shr 16) and 0xff).toByte()
         h[43] = ((totalAudioLen shr 24) and 0xff).toByte()
         return h
-    }
-
-    // ---- video-only MP4 (jcodec) — used by VIDEO directly and by MOVIE step 1 ----
-
-    private fun encodeMp4(frames: List<GlassFrame>, periodMs: Long, outputFile: File) {
-        // Glass only sends frames it managed to push over BT; drops appear as
-        // gaps in the timestamp sequence. Hold the previous frame across each
-        // gap so playback runs at real time and "freezes" on dropped regions
-        // instead of speeding up. periodMs is the glass-side capture period
-        // (received in capture_start) — authoritative, not estimated.
-        val period = periodMs.coerceAtLeast(1L)
-        val expanded = expandWithGapFill(frames, period)
-        val fps = computePlaybackFps(period)
-        Log.d(TAG, "encodeMp4 origFrames=${frames.size} expanded=${expanded.size} period=${period}ms fps=${fps.num}/${fps.den}")
-        val out = NIOUtils.writableChannel(outputFile)
-        try {
-            val encoder = AndroidSequenceEncoder(out, fps)
-            // Decode each unique frame once; reuse for duplicates that fill gaps.
-            var lastJpeg: ByteArray? = null
-            var lastBitmap: android.graphics.Bitmap? = null
-            for (frame in expanded) {
-                val bmp = if (frame.jpeg === lastJpeg && lastBitmap != null && !lastBitmap.isRecycled) {
-                    lastBitmap
-                } else {
-                    lastBitmap?.recycle()
-                    val decoded = GlassImage.decode(frame) ?: continue
-                    lastJpeg = frame.jpeg
-                    lastBitmap = decoded
-                    decoded
-                }
-                val even = ensureEvenDimensions(bmp)
-                encoder.encodeImage(even)
-                if (even !== bmp) even.recycle()
-            }
-            lastBitmap?.recycle()
-            encoder.finish()
-        } finally {
-            NIOUtils.closeQuietly(out)
-        }
-    }
-
-    /**
-     * Where consecutive timestamps are >1.5× the period apart, repeat the
-     * previous frame to fill. Each duplicate keeps the original `jpeg`
-     * reference so the encoder can avoid re-decoding (see encodeMp4).
-     */
-    private fun expandWithGapFill(frames: List<GlassFrame>, periodMs: Long): List<GlassFrame> {
-        if (frames.size < 2) return frames
-        val threshold = (periodMs * 3) / 2
-        val out = ArrayList<GlassFrame>(frames.size)
-        for (i in frames.indices) {
-            out.add(frames[i])
-            if (i == frames.size - 1) continue
-            val actualGap = frames[i + 1].timestampMs - frames[i].timestampMs
-            if (actualGap > threshold) {
-                val nFill = ((actualGap / periodMs) - 1).toInt().coerceAtLeast(0)
-                repeat(nFill) { out.add(frames[i]) }
-            }
-        }
-        return out
-    }
-
-    /**
-     * Playback FPS = 1000 / periodMs (clamped). After expandWithGapFill the
-     * frame list is uniform at periodMs intervals, so encoding at this rate
-     * yields real-time playback.
-     */
-    private fun computePlaybackFps(periodMs: Long): Rational {
-        val fpsX100 = (100_000L / periodMs).toInt().coerceIn(50, 6000)
-        return Rational.R(fpsX100, 100)
-    }
-
-    private fun ensureEvenDimensions(src: android.graphics.Bitmap): android.graphics.Bitmap {
-        val w = src.width and 1.inv()
-        val h = src.height and 1.inv()
-        return if (w == src.width && h == src.height) src
-        else android.graphics.Bitmap.createBitmap(src, 0, 0, w, h)
     }
 }

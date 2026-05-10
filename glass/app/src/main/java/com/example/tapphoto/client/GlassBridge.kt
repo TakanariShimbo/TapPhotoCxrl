@@ -14,8 +14,6 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 
 private const val TAG = "GlassBridge"
-private const val CHANNEL_FROM_PHONE = "rk_custom_client"
-private const val CHANNEL_TO_PHONE = "rk_custom_key"
 private const val PING_TIMEOUT_MS = 12_000L
 private const val RESULT_RESET_MS = 2_000L
 
@@ -25,10 +23,6 @@ private const val PHOTO_QUALITY = 80
 private const val VIDEO_TARGET_W = 480
 private const val VIDEO_TARGET_H = 360
 private const val VIDEO_QUALITY = 50
-
-private const val FRAME_KIND_PHOTO = "photo"
-private const val FRAME_KIND_VIDEO = "video"
-private const val FRAME_KIND_MOVIE = "movie"
 
 enum class BridgeStatus { DISCONNECTED, CONNECTING, CONNECTED }
 
@@ -46,36 +40,25 @@ enum class BridgeStatus { DISCONNECTED, CONNECTING, CONNECTED }
 enum class CaptureState { IDLE, CAPTURING, CAPTURED, FAILED, RUNNING }
 
 /**
- * Output media kind, parallel set:
+ * Output media kind. Wire form is the lowercase enum name.
  *   PHOTO  — single image
  *   VIDEO  — continuous frames, no audio
  *   AUDIO  — continuous audio, no video
  *   MOVIE  — VIDEO + AUDIO together
  */
-enum class CaptureMode { PHOTO, VIDEO, AUDIO, MOVIE }
+enum class CaptureMode {
+    PHOTO, VIDEO, AUDIO, MOVIE;
 
-private fun CaptureMode.usesCamera(): Boolean = this != CaptureMode.AUDIO
-private fun CaptureMode.usesAudio(): Boolean = this == CaptureMode.AUDIO || this == CaptureMode.MOVIE
-private fun CaptureMode.isContinuous(): Boolean = this != CaptureMode.PHOTO
-
-private fun CaptureMode.wireString(): String = when (this) {
-    CaptureMode.PHOTO -> "photo"
-    CaptureMode.VIDEO -> "video"
-    CaptureMode.AUDIO -> "audio"
-    CaptureMode.MOVIE -> "movie"
+    fun toWire(): String = name.lowercase()
 }
 
-/** Frame.kind for the streaming continuous modes. PHOTO uses [FRAME_KIND_PHOTO] directly. */
-private fun CaptureMode.continuousFrameKind(): String = when (this) {
-    CaptureMode.VIDEO -> FRAME_KIND_VIDEO
-    CaptureMode.MOVIE -> FRAME_KIND_MOVIE
-    else -> FRAME_KIND_VIDEO
-}
+internal fun CaptureMode.usesCamera(): Boolean = this == CaptureMode.VIDEO || this == CaptureMode.MOVIE
+internal fun CaptureMode.usesAudio(): Boolean = this == CaptureMode.AUDIO || this == CaptureMode.MOVIE
 
 /**
  * State + protocol owner on the glass. Wire format:
  *   phone → glass:  session_open / ping / session_close
- *   glass → phone:  frame{kind} / capture_start{kind, period_ms?} / capture_end /
+ *   glass → phone:  frame / capture_start{kind, period_ms?} / capture_end /
  *                   mode_change{mode}
  */
 object GlassBridge {
@@ -155,10 +138,10 @@ object GlassBridge {
                 override fun onARTCStatus(p0: Float, p1: Boolean) {}
                 override fun onRokidAccountChanged(p0: String?) {}
             })
-            subscribe(CHANNEL_FROM_PHONE, object : CXRServiceBridge.MsgCallback {
+            subscribe(Wire.CHANNEL_FROM_PHONE, object : CXRServiceBridge.MsgCallback {
                 override fun onReceive(name: String?, args: Caps?, bytes: ByteArray?) {
                     val event = readEvent(args) ?: return
-                    if (event != "ping") Log.d(TAG, "<- $event  state=${_captureState.value}")
+                    if (event != Wire.EVENT_PING) Log.d(TAG, "<- $event  state=${_captureState.value}")
                     mainHandler.post { handlePhoneEvent(event) }
                 }
             })
@@ -169,16 +152,16 @@ object GlassBridge {
 
     private fun handlePhoneEvent(event: String) {
         when (event) {
-            "session_open" -> {
+            Wire.EVENT_SESSION_OPEN -> {
                 _sessionOpen.value = true
                 armPingWatchdog()
                 sendModeChange()  // resync: phone may have just (re)connected
             }
-            "ping" -> {
+            Wire.EVENT_PING -> {
                 _sessionOpen.value = true
                 armPingWatchdog()
             }
-            "session_close" -> {
+            Wire.EVENT_SESSION_CLOSE -> {
                 _sessionOpen.value = false
                 stopPingWatchdog()
                 resetCapture("session_close")
@@ -194,7 +177,7 @@ object GlassBridge {
             return
         }
         val mode = _mode.value
-        if (!mode.isContinuous()) {
+        if (mode == CaptureMode.PHOTO) {
             tapPhoto()
             return
         }
@@ -252,7 +235,7 @@ object GlassBridge {
             Log.w(TAG, "photo result in unexpected state=${_captureState.value} (dropped)")
             return
         }
-        val sent = sendFrame(FRAME_KIND_PHOTO, jpeg, w, h, rot, captureTs)
+        val sent = sendFrame(jpeg, w, h, rot, captureTs)
         if (sent) {
             CameraSfx.playShutter()
             scheduleResetTo(CaptureState.CAPTURED)
@@ -302,7 +285,7 @@ object GlassBridge {
             GlassCamera.stopContinuous()
             stopSender()
         }
-        sendEvent("capture_end")
+        sendBareEvent(Wire.EVENT_CAPTURE_END)
         _captureState.value = CaptureState.IDLE
     }
 
@@ -313,7 +296,7 @@ object GlassBridge {
             GlassCamera.stopContinuous()
             stopSender()
         }
-        sendEvent("capture_end")
+        sendBareEvent(Wire.EVENT_CAPTURE_END)
         CameraSfx.playFail()
         scheduleResetTo(CaptureState.FAILED)
     }
@@ -333,20 +316,17 @@ object GlassBridge {
     /**
      * Sender-side drain. Posted by producer for every new frame. Multiple
      * pending posts are harmless — whoever runs while the slot has content
-     * sends it; later runs that find an empty slot are no-ops. The frame
-     * `kind` is derived from the current mode at send time (no separate
-     * volatile field needed).
+     * sends it; later runs that find an empty slot are no-ops.
      */
     private fun drainSlotOnce() {
         val f = frameSlot.getAndSet(null) ?: return
-        val kind = _mode.value.continuousFrameKind()
         val t0 = SystemClock.uptimeMillis()
         val ok = try {
-            sendFrame(kind, f.jpeg, f.w, f.h, f.rot, f.captureTs)
+            sendFrame(f.jpeg, f.w, f.h, f.rot, f.captureTs)
         } catch (t: Throwable) {
             Log.w(TAG, "frame send threw", t); false
         }
-        Log.d(TAG, "frame send($kind): send=${SystemClock.uptimeMillis() - t0}ms ok=$ok size=${f.jpeg.size}")
+        Log.d(TAG, "frame send: send=${SystemClock.uptimeMillis() - t0}ms ok=$ok size=${f.jpeg.size}")
     }
 
     private fun startSender() {
@@ -398,76 +378,69 @@ object GlassBridge {
         mainHandler.removeCallbacks(pingTimeoutRunnable)
     }
 
-    private fun sendEvent(event: String) {
-        val b = bridge ?: run {
-            Log.w(TAG, "sendEvent($event) dropped: bridge null")
-            return
-        }
-        Log.d(TAG, "-> $event")
-        val caps = Caps().apply {
-            write("event"); write(event)
-            write("ts"); writeInt64(System.currentTimeMillis())
-        }
-        runCatching { b.sendMessage(CHANNEL_TO_PHONE, caps) }
-            .onFailure { Log.w(TAG, "sendMessage($event) failed", it) }
-    }
+    // ---- wire send ----
 
-    private fun sendCaptureStart(mode: CaptureMode) {
-        val b = bridge ?: run {
-            Log.w(TAG, "sendCaptureStart dropped: bridge null")
-            return
-        }
-        val kind = mode.wireString()
-        val withPeriod = mode.usesCamera()
-        Log.d(TAG, "-> capture_start kind=$kind${if (withPeriod) " period_ms=$CAMERA_FRAME_PERIOD_MS" else ""}")
-        val caps = Caps().apply {
-            write("event"); write("capture_start")
-            write("kind"); write(kind)
-            write("ts"); writeInt64(System.currentTimeMillis())
-            if (withPeriod) {
-                write("period_ms"); writeInt64(CAMERA_FRAME_PERIOD_MS)
+    private fun sendBareEvent(event: String) =
+        send(event) {}
+
+    private fun sendCaptureStart(mode: CaptureMode) =
+        send(Wire.EVENT_CAPTURE_START) {
+            write(Wire.FIELD_KIND); write(mode.toWire())
+            if (mode.usesCamera()) {
+                write(Wire.FIELD_PERIOD_MS); writeInt64(CAMERA_FRAME_PERIOD_MS)
             }
         }
-        runCatching { b.sendMessage(CHANNEL_TO_PHONE, caps) }
-            .onFailure { Log.w(TAG, "sendCaptureStart failed", it) }
-    }
 
-    private fun sendModeChange() {
-        val b = bridge ?: return
-        val modeStr = _mode.value.wireString()
-        Log.d(TAG, "-> mode_change ($modeStr)")
-        val caps = Caps().apply {
-            write("event"); write("mode_change")
-            write("mode"); write(modeStr)
-            write("ts"); writeInt64(System.currentTimeMillis())
+    private fun sendModeChange() =
+        send(Wire.EVENT_MODE_CHANGE) {
+            write(Wire.FIELD_MODE); write(_mode.value.toWire())
         }
-        runCatching { b.sendMessage(CHANNEL_TO_PHONE, caps) }
-            .onFailure { Log.w(TAG, "sendModeChange failed", it) }
-    }
 
-    private fun sendFrame(kind: String, jpeg: ByteArray, w: Int, h: Int, rot: Int, captureTs: Long): Boolean {
-        val b = bridge ?: return false
-        val caps = Caps().apply {
-            write("event"); write("frame")
-            write("kind"); write(kind)
-            write("w"); writeInt32(w)
-            write("h"); writeInt32(h)
-            write("rot"); writeInt32(rot)
-            write("ts"); writeInt64(captureTs)  // capture time, not send time
-            write("data"); write(jpeg)
+    private fun sendFrame(jpeg: ByteArray, w: Int, h: Int, rot: Int, captureTs: Long): Boolean =
+        send(Wire.EVENT_FRAME, captureTs) {
+            write(Wire.FIELD_W); writeInt32(w)
+            write(Wire.FIELD_H); writeInt32(h)
+            write(Wire.FIELD_ROT); writeInt32(rot)
+            write(Wire.FIELD_DATA); write(jpeg)
         }
-        val result = runCatching { b.sendMessage(CHANNEL_TO_PHONE, caps) }
-            .onFailure { Log.w(TAG, "frame send threw", it) }
+
+    /**
+     * Build `{event, ts, ...extra}` Caps and send it. `ts` defaults to wall
+     * clock (`now`); pass an explicit value for events whose timestamp is
+     * meaningful elsewhere (e.g., frame capture time).
+     *
+     * Returns true if the bridge accepted the message (`sendMessage` → 0).
+     * Logs any failure and returns false.
+     */
+    private inline fun send(
+        event: String,
+        ts: Long = System.currentTimeMillis(),
+        extra: Caps.() -> Unit,
+    ): Boolean {
+        val b = bridge ?: run {
+            Log.w(TAG, "send($event) dropped: bridge null")
+            return false
+        }
+        if (event != Wire.EVENT_PING) Log.d(TAG, "-> $event")
+        val caps = Caps().apply {
+            write(Wire.FIELD_EVENT); write(event)
+            write(Wire.FIELD_TS); writeInt64(ts)
+            extra()
+        }
+        val result = runCatching { b.sendMessage(Wire.CHANNEL_TO_PHONE, caps) }
+            .onFailure { Log.w(TAG, "send($event) threw", it) }
             .getOrDefault(-1)
-        if (result != 0) Log.w(TAG, "frame send result=$result kind=$kind size=${jpeg.size}")
+        if (result != 0) Log.w(TAG, "send($event) result=$result")
         return result == 0
     }
+
+    // ---- wire read ----
 
     private fun readEvent(caps: Caps?): String? {
         if (caps == null) return null
         for (i in 0 until caps.size() - 1) {
             val key = caps.at(i)
-            if (key.type() == Caps.Value.TYPE_STRING && key.string == "event") {
+            if (key.type() == Caps.Value.TYPE_STRING && key.string == Wire.FIELD_EVENT) {
                 val v = caps.at(i + 1)
                 if (v.type() == Caps.Value.TYPE_STRING) return v.string
             }

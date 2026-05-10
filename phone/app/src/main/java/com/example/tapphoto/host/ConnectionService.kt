@@ -31,34 +31,38 @@ private const val CHANNEL_ID = "cxrl_connection"
 private const val NOTIF_ID = 1
 private const val GLASS_APP_PKG = "com.example.tapphoto.client"
 private const val GLASS_MAIN_ACTIVITY = "com.example.tapphoto.client.MainActivity"
-private const val CHANNEL_TO_GLASS = "rk_custom_client"
-private const val CHANNEL_FROM_GLASS = "rk_custom_key"
 private const val HEARTBEAT_INTERVAL_MS = 5_000L
+
+/**
+ * Connection state mirrored to the UI. Same 3 values used everywhere on
+ * phone (status notification, MainActivity, button enable/disable).
+ */
+enum class ConnectionState { DISCONNECTED, CONNECTING, CONNECTED }
 
 /**
  * Capture mode mirrored from glass. Used both for the UI status display
  * (`mode_change` event) and as the session kind on `capture_start` for
- * newer-wins arbitration. The two contexts always carry the same vocabulary
- * so we keep a single enum.
+ * newer-wins arbitration. Wire form is the lowercase enum name.
  */
-enum class GlassMode { PHOTO, VIDEO, AUDIO, MOVIE }
+enum class CaptureMode {
+    PHOTO, VIDEO, AUDIO, MOVIE;
 
-private fun parseGlassMode(s: String): GlassMode? = when (s) {
-    "photo" -> GlassMode.PHOTO
-    "video" -> GlassMode.VIDEO
-    "audio" -> GlassMode.AUDIO
-    "movie" -> GlassMode.MOVIE
-    else -> null
+    fun toWire(): String = name.lowercase()
+
+    companion object {
+        fun fromWire(s: String): CaptureMode? =
+            entries.firstOrNull { it.name.equals(s, ignoreCase = true) }
+    }
 }
 
-private fun GlassMode.usesVideo(): Boolean = this == GlassMode.VIDEO || this == GlassMode.MOVIE
-private fun GlassMode.usesAudio(): Boolean = this == GlassMode.AUDIO || this == GlassMode.MOVIE
+internal fun CaptureMode.usesCamera(): Boolean = this == CaptureMode.VIDEO || this == CaptureMode.MOVIE
+internal fun CaptureMode.usesAudio(): Boolean = this == CaptureMode.AUDIO || this == CaptureMode.MOVIE
 
 /**
  * Foreground service that holds the CXRL link and renders frames coming from
  * the glass. Wire format:
  *   phone → glass:  session_open / ping / session_close
- *   glass → phone:  frame{kind} / capture_start{kind, period_ms?} / capture_end /
+ *   glass → phone:  frame / capture_start{kind, period_ms?} / capture_end /
  *                   mode_change{mode}
  *
  * In addition the Hi Rokid SDK delivers raw PCM to phone via IAudioStreamCbk
@@ -75,7 +79,7 @@ class ConnectionService : Service() {
 
     private val heartbeatRunnable = object : Runnable {
         override fun run() {
-            sendCapsEvent("ping")
+            sendCapsEvent(Wire.EVENT_PING)
             mainHandler.postDelayed(this, HEARTBEAT_INTERVAL_MS)
         }
     }
@@ -92,7 +96,7 @@ class ConnectionService : Service() {
         val token = TokenStore.token.value
         if (token.isNullOrBlank()) {
             Log.w(TAG, "no token, foreground only (idle)")
-            updateConnectionState(CxrConnState.DISCONNECTED, "token なし — 認証してください")
+            updateConnectionState(ConnectionState.DISCONNECTED, "token なし — 認証してください")
             return START_STICKY
         }
 
@@ -103,21 +107,21 @@ class ConnectionService : Service() {
     override fun onDestroy() {
         _running.value = false
         mainHandler.removeCallbacksAndMessages(null)
-        sendCapsEvent("session_close")
+        sendCapsEvent(Wire.EVENT_SESSION_CLOSE)
         // Stop any in-flight audio stream so the SDK doesn't keep pushing PCM
         // to a callback whose AudioRecorder file we're about to discard.
         if (AudioRecorder.recording.value) {
             runCatching { cxrLink?.stopAudioStream() }
             AudioRecorder.stopRecording()
         }
+        VideoRecorder.stopRecording()
+        FpsTracker.reset()
         runCatching { cxrLink?.disconnect() }
         cxrLink = null
         lConnected = false
         btConnected = false
         appStarted = false
-        _videoActive.value = false
-        FpsTracker.reset()
-        _connState.value = CxrConnState.DISCONNECTED
+        _connState.value = ConnectionState.DISCONNECTED
         stopForeground(STOP_FOREGROUND_REMOVE)
         super.onDestroy()
     }
@@ -126,7 +130,7 @@ class ConnectionService : Service() {
 
     private fun startLink(token: String) {
         Log.d(TAG, "startLink token len=${token.length}")
-        updateConnectionState(CxrConnState.CONNECTING, "接続中…")
+        updateConnectionState(ConnectionState.CONNECTING, "接続中…")
         cxrLink = CXRLink(this).apply {
             configCXRSession(
                 CxrDefs.CXRSession(CxrDefs.CXRSessionType.CUSTOMAPP, GLASS_APP_PKG),
@@ -149,9 +153,9 @@ class ConnectionService : Service() {
             })
             setCXRCustomCmdCbk(object : ICustomCmdCbk {
                 override fun onCustomCmdResult(key: String, payload: ByteArray) {
-                    if (key != CHANNEL_FROM_GLASS) return
+                    if (key != Wire.CHANNEL_FROM_GLASS) return
                     val caps = Caps.fromBytes(payload) ?: return
-                    val event = readEvent(caps) ?: return
+                    val event = caps.readEvent() ?: return
                     mainHandler.post { handleGlassMessage(event, caps) }
                 }
             })
@@ -178,166 +182,135 @@ class ConnectionService : Service() {
 
     private fun handleGlassMessage(event: String, caps: Caps) {
         when (event) {
-            "frame" -> handleFrame(caps)
-            "capture_start" -> handleCaptureStart(caps)
-            "capture_end" -> handleCaptureEnd()
-            "mode_change" -> handleModeChange(caps)
+            Wire.EVENT_FRAME -> handleFrame(caps)
+            Wire.EVENT_CAPTURE_START -> handleCaptureStart(caps)
+            Wire.EVENT_CAPTURE_END -> handleCaptureEnd()
+            Wire.EVENT_MODE_CHANGE -> handleModeChange(caps)
             else -> Log.d(TAG, "ignore unknown glass event: $event")
         }
     }
 
     private fun handleModeChange(caps: Caps) {
-        val modeStr = readString(caps, "mode") ?: return
-        val mode = parseGlassMode(modeStr) ?: run {
+        val modeStr = caps.readString(Wire.FIELD_MODE) ?: return
+        val mode = CaptureMode.fromWire(modeStr) ?: run {
             Log.w(TAG, "mode_change unknown mode=$modeStr")
             return
         }
         Log.d(TAG, "<- mode_change $modeStr")
-        _glassMode.value = mode
+        _captureMode.value = mode
+        switchSessionBuffers(mode)
     }
 
     private fun handleFrame(caps: Caps) {
         val frame = GlassImage.parse(caps) ?: return
         val bitmap = GlassImage.decode(frame) ?: return
         PhotoStore.set(bitmap.asImageBitmap(), frame)
-        if (_videoActive.value) {
+        if (VideoRecorder.recording.value) {
             FpsTracker.tick()
             VideoRecorder.add(frame)
-        } else if (frame.kind == "photo") {
-            // a fresh photo supersedes any previously recorded session content
-            switchSession(GlassMode.PHOTO)
         }
     }
 
     /**
      * Single capture-session entry point. Glass tells us what kind via
-     * [GlassMode] and (for video-bearing kinds) the camera period. We
-     * arbitrate "newer wins" across PhotoStore / VideoRecorder / AudioRecorder
-     * here so each individual handler doesn't have to remember which buffers
-     * to clear.
+     * [CaptureMode] and (for video-bearing kinds) the camera period. The
+     * mode_change that precedes capture_start has already cleared the stale
+     * buffers; here we just (re)start the relevant recorders.
      */
     private fun handleCaptureStart(caps: Caps) {
-        val kindStr = readString(caps, "kind") ?: return
-        val kind = parseGlassMode(kindStr) ?: run {
+        val kindStr = caps.readString(Wire.FIELD_KIND) ?: return
+        val kind = CaptureMode.fromWire(kindStr) ?: run {
             Log.w(TAG, "capture_start unknown kind=$kindStr")
             return
         }
-        if (kind == GlassMode.PHOTO) {
+        if (kind == CaptureMode.PHOTO) {
             Log.w(TAG, "capture_start ignored: photo doesn't use sessions")
             return
         }
-        val periodMs = readInt64(caps, "period_ms") ?: 1000L
+        val periodMs = caps.readInt64(Wire.FIELD_PERIOD_MS) ?: 1000L
         Log.d(TAG, "<- capture_start kind=$kindStr period_ms=$periodMs")
-        switchSession(kind)
-        if (kind.usesVideo()) {
+        switchSessionBuffers(kind)
+        if (kind.usesCamera()) {
             VideoRecorder.startNewSession(periodMs)
-            _videoActive.value = true
             FpsTracker.reset()
         }
         if (kind.usesAudio()) {
-            AudioRecorder.startNewSession(applicationContext)
+            AudioRecorder.startNewSession(applicationContext.cacheDir)
             val ok = cxrLink?.startAudioStream(1)
             Log.d(TAG, "startAudioStream → $ok")
         }
     }
 
     private fun handleCaptureEnd() {
-        Log.d(TAG, "<- capture_end (videoActive=${_videoActive.value})")
+        Log.d(TAG, "<- capture_end (videoRecording=${VideoRecorder.recording.value})")
         if (AudioRecorder.recording.value) {
             val ok = cxrLink?.stopAudioStream()
             Log.d(TAG, "stopAudioStream → $ok")
             AudioRecorder.stopRecording()
         }
-        if (_videoActive.value) {
-            _videoActive.value = false
+        if (VideoRecorder.recording.value) {
+            VideoRecorder.stopRecording()
             FpsTracker.reset()
         }
     }
 
     /**
      * "Newer wins" — clear buffers that are NOT relevant to the incoming
-     * session kind so save-time priority logic stays unambiguous. The
-     * recorders that the new session will populate are reset by their own
-     * `startNewSession` calls in the caller, so we only clear the others.
+     * mode/kind so save-time priority logic stays unambiguous. Recorders
+     * that the new session will repopulate are reset by their own
+     * `startNewSession` calls in [handleCaptureStart].
      */
-    private fun switchSession(kind: GlassMode) {
+    private fun switchSessionBuffers(kind: CaptureMode) {
         when (kind) {
-            GlassMode.PHOTO -> {
+            CaptureMode.PHOTO -> {
                 VideoRecorder.clear()
                 AudioRecorder.clear()
             }
-            GlassMode.VIDEO -> {
+            CaptureMode.VIDEO -> {
                 PhotoStore.clear()
                 AudioRecorder.clear()
             }
-            GlassMode.AUDIO -> {
+            CaptureMode.AUDIO -> {
                 PhotoStore.clear()
                 VideoRecorder.clear()
             }
-            GlassMode.MOVIE -> {
+            CaptureMode.MOVIE -> {
                 PhotoStore.clear()
-                // VideoRecorder + AudioRecorder will both be (re)started by
-                // handleCaptureStart, so no explicit clear needed for them.
+                // VideoRecorder + AudioRecorder are about to be (re)started.
             }
         }
     }
 
     // ---- helpers ----
 
-    private fun readEvent(caps: Caps): String? = readString(caps, "event")
-
-    private fun readString(caps: Caps, fieldName: String): String? = runCatching {
-        for (i in 0 until caps.size() - 1) {
-            val key = caps.at(i)
-            if (key.type() == Caps.Value.TYPE_STRING && key.string == fieldName) {
-                val v = caps.at(i + 1)
-                if (v.type() == Caps.Value.TYPE_STRING) return@runCatching v.string
-            }
-        }
-        null
-    }.getOrNull()
-
-    private fun readInt64(caps: Caps, fieldName: String): Long? = runCatching {
-        for (i in 0 until caps.size() - 1) {
-            val key = caps.at(i)
-            if (key.type() == Caps.Value.TYPE_STRING && key.string == fieldName) {
-                val v = caps.at(i + 1)
-                if (v.type() == Caps.Value.TYPE_INT64 || v.type() == Caps.Value.TYPE_UINT64) {
-                    return@runCatching v.long
-                }
-            }
-        }
-        null
-    }.getOrNull()
-
     private fun refreshConnState() {
         val state = when {
-            lConnected && btConnected -> CxrConnState.CONNECTED
-            else -> CxrConnState.CONNECTING
+            lConnected && btConnected -> ConnectionState.CONNECTED
+            else -> ConnectionState.CONNECTING
         }
         val text = when (state) {
-            CxrConnState.CONNECTED -> "接続済み"
-            CxrConnState.CONNECTING -> "接続中… (L=$lConnected BT=$btConnected)"
-            CxrConnState.DISCONNECTED -> "切断"
+            ConnectionState.CONNECTED -> "接続済み"
+            ConnectionState.CONNECTING -> "接続中… (L=$lConnected BT=$btConnected)"
+            ConnectionState.DISCONNECTED -> "切断"
         }
         updateConnectionState(state, text)
-        if (state != CxrConnState.CONNECTED && _videoActive.value) {
-            Log.d(TAG, "disconnect: clearing video active state")
-            _videoActive.value = false
+        if (state != ConnectionState.CONNECTED && VideoRecorder.recording.value) {
+            Log.d(TAG, "disconnect: stopping video recording")
+            VideoRecorder.stopRecording()
             FpsTracker.reset()
         }
-        if (state == CxrConnState.CONNECTED && !appStarted) {
+        if (state == ConnectionState.CONNECTED && !appStarted) {
             appStarted = true
             Log.d(TAG, "appStart $GLASS_MAIN_ACTIVITY")
             cxrLink?.appStart(GLASS_MAIN_ACTIVITY, object : IGlassAppCbk {
                 override fun onOpenAppResult(success: Boolean) {
                     Log.d(TAG, "onOpenAppResult: $success")
-                    if (success) sendCapsEvent("session_open")
+                    if (success) sendCapsEvent(Wire.EVENT_SESSION_OPEN)
                 }
 
                 override fun onGlassAppResume(resume: Boolean) {
                     Log.d(TAG, "onGlassAppResume: $resume")
-                    if (resume) sendCapsEvent("session_open")
+                    if (resume) sendCapsEvent(Wire.EVENT_SESSION_OPEN)
                 }
             })
         }
@@ -345,25 +318,23 @@ class ConnectionService : Service() {
 
     private fun sendCapsEvent(event: String) {
         val link = cxrLink ?: return
-        if (event != "ping") Log.d(TAG, "-> $event")
+        if (event != Wire.EVENT_PING) Log.d(TAG, "-> $event")
         val payload = Caps().apply {
-            write("event")
-            write(event)
-            write("ts")
-            writeInt64(System.currentTimeMillis())
+            write(Wire.FIELD_EVENT); write(event)
+            write(Wire.FIELD_TS); writeInt64(System.currentTimeMillis())
         }.serialize()
-        runCatching { link.sendCustomCmd(CHANNEL_TO_GLASS, payload) }
+        runCatching { link.sendCustomCmd(Wire.CHANNEL_TO_GLASS, payload) }
             .onFailure { Log.w(TAG, "sendCapsEvent($event) failed", it) }
         when (event) {
-            "session_open" -> {
+            Wire.EVENT_SESSION_OPEN -> {
                 mainHandler.removeCallbacks(heartbeatRunnable)
                 mainHandler.postDelayed(heartbeatRunnable, HEARTBEAT_INTERVAL_MS)
             }
-            "session_close" -> mainHandler.removeCallbacks(heartbeatRunnable)
+            Wire.EVENT_SESSION_CLOSE -> mainHandler.removeCallbacks(heartbeatRunnable)
         }
     }
 
-    private fun updateConnectionState(state: CxrConnState, notifText: String) {
+    private fun updateConnectionState(state: ConnectionState, notifText: String) {
         _connState.value = state
         val nm = getSystemService(NotificationManager::class.java) ?: return
         nm.notify(NOTIF_ID, buildNotification(notifText))
@@ -411,14 +382,11 @@ class ConnectionService : Service() {
         private val _running = MutableStateFlow(false)
         val running: StateFlow<Boolean> = _running.asStateFlow()
 
-        private val _connState = MutableStateFlow(CxrConnState.DISCONNECTED)
-        val connState: StateFlow<CxrConnState> = _connState.asStateFlow()
+        private val _connState = MutableStateFlow(ConnectionState.DISCONNECTED)
+        val connState: StateFlow<ConnectionState> = _connState.asStateFlow()
 
-        private val _glassMode = MutableStateFlow(GlassMode.PHOTO)
-        val glassMode: StateFlow<GlassMode> = _glassMode.asStateFlow()
-
-        private val _videoActive = MutableStateFlow(false)
-        val videoActive: StateFlow<Boolean> = _videoActive.asStateFlow()
+        private val _captureMode = MutableStateFlow(CaptureMode.PHOTO)
+        val captureMode: StateFlow<CaptureMode> = _captureMode.asStateFlow()
 
         fun start(context: Context) {
             val intent = Intent(context, ConnectionService::class.java)
@@ -431,5 +399,3 @@ class ConnectionService : Service() {
         }
     }
 }
-
-enum class CxrConnState { DISCONNECTED, CONNECTING, CONNECTED }

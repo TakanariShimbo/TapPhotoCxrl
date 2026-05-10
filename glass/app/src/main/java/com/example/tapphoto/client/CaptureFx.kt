@@ -62,10 +62,9 @@ private const val FLASH_PEAK_ALPHA = 0.45f
 fun CaptureFx(state: CaptureState, mode: CaptureMode) {
     // Camera-related visuals (brackets) appear during PHOTO capture and during
     // RUNNING when the mode uses the camera (VIDEO / MOVIE).
-    val cameraActive = state == CaptureState.RUNNING && mode.usesCameraVisual()
     val showBrackets = state == CaptureState.CAPTURING ||
         state == CaptureState.CAPTURED ||
-        cameraActive
+        (state == CaptureState.RUNNING && mode.usesCamera())
 
     Box(modifier = Modifier.fillMaxSize()) {
         ModeBadge(
@@ -164,9 +163,6 @@ private fun CaptureMode.failedLabel(): String = when (this) {
     CaptureMode.AUDIO -> "録音失敗"
     CaptureMode.MOVIE -> "ムービー失敗"
 }
-
-private fun CaptureMode.usesCameraVisual(): Boolean =
-    this == CaptureMode.VIDEO || this == CaptureMode.MOVIE || this == CaptureMode.PHOTO
 
 @Composable
 private fun ModeBadge(

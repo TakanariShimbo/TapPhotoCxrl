@@ -92,7 +92,7 @@ CAPTURED / FAILED は **2 秒後に IDLE 復帰**。RUNNING は次のタップ (
 3. `TEMPLATE_STILL_CAPTURE` を 1 ショット投げる → `ImageReader.OnImageAvailableListener` で JPEG bytes と **撮影時刻** を取得
 4. PHOTO は 3 を 1 回だけ。VIDEO / MOVIE は **撮影スレッド** (`glass-camera`) が `CAMERA_FRAME_PERIOD_MS` (1000ms) の **固定周期** で 3 を打ち続ける (送信時間に引きずられない)
 5. VIDEO / MOVIE の送信は別スレッド (`glass-bt-sender`) で動き、producer↔consumer 間は **容量 1 の slot** (`AtomicReference`)。送信が周期に追いつかなければ古いキューが新フレームに上書きされる (`queued frame skipped` ログ)。撮影時刻は wire の `ts` に載るので、phone は drop 区間を timestamp で検出できる
-6. 取得した JPEG は **回転を適用せず**、Caps に `rot = SENSOR_ORIENTATION` を載せて送信 (回転はスマホ側で実施)。frame の `kind` は VIDEO 中は `video`、MOVIE 中は `movie`、PHOTO は `photo`
+6. 取得した JPEG は **回転を適用せず**、Caps に `rot = SENSOR_ORIENTATION` を載せて送信 (回転はスマホ側で実施)。frame に種別フィールドは無い — phone 側は `VideoRecorder.recording` で写真フレームと連続フレームを区別する
 7. MOVIE は VIDEO のフロー (1〜6) に加えて、開始時に `capture_start{kind=movie}` イベントを送るだけで音声録音は phone 側で `cxrLink.startAudioStream(1)` を呼んで Hi Rokid SDK に任せる (グラス側は音声に触れない)
 
 ### スマホ側
@@ -103,16 +103,15 @@ CAPTURED / FAILED は **2 秒後に IDLE 復帰**。RUNNING は次のタップ (
   - 通常: 「最新の写真 (HH:mm:ss)」
   - 連続撮影中: 「**ライブ映像 (X.X fps)**」 — `FpsTracker` がローリング平均で算出
 - グラスからのイベント別動作:
-  - `frame{kind=photo, w, h, rot, ts, data}` → `GlassImage.decode` で回転込み Bitmap → `PhotoStore`
-  - `frame{kind=video, ...}` / `frame{kind=movie, ...}` → 同上 + `FpsTracker.tick` + `VideoRecorder.add` (mp4 化用に蓄積)
-  - `capture_start{kind, period_ms?}` → `GlassMode` を該当モードへ。VIDEO / MOVIE なら `VideoRecorder.startNewSession(period_ms)`、AUDIO / MOVIE なら `AudioRecorder.startNewSession()` + `cxrLink.startAudioStream(1)` で Hi Rokid から PCM ストリーミング受信開始 (PCM は `cacheDir/audio_<ts>.pcm` に逐次書き出し)
+  - `frame{w, h, rot, ts, data}` → `GlassImage.decode` で回転込み Bitmap → `PhotoStore`。`VideoRecorder.recording` が true なら追加で `FpsTracker.tick` + `VideoRecorder.add` (mp4 化用に蓄積)
+  - `capture_start{kind, period_ms?}` → `CaptureMode` を該当モードへ。VIDEO / MOVIE なら `VideoRecorder.startNewSession(period_ms)`、AUDIO / MOVIE なら `AudioRecorder.startNewSession()` + `cxrLink.startAudioStream(1)` で Hi Rokid から PCM ストリーミング受信開始 (PCM は `cacheDir/audio_<ts>.pcm` に逐次書き出し)
   - `capture_end` → 開始したものを停止: `VideoRecorder.stopRecording()` / `AudioRecorder.stopRecording()` + `cxrLink.stopAudioStream()`
   - `mode_change{mode}` → スマホ側の表示モードを PHOTO/VIDEO/AUDIO/MOVIE に同期 (バッファ整合をここで実施)
-- "newer wins" バッファ整合: モード遷移 (`mode_change` または `capture_start`) 時に新モードが要求しないバッファをクリア。例: 新 PHOTO は VIDEO/AUDIO バッファを破棄、新 VIDEO は AUDIO バッファを破棄、新 AUDIO は VIDEO バッファ + 表示中の写真も破棄、新 MOVIE は写真をクリアしつつ VIDEO/AUDIO バッファ両方を新規セッションで上書き
+- "newer wins" バッファ整合: モード遷移 (`mode_change` または `capture_start`) 時に新モードが要求しないバッファを `switchSessionBuffers()` でまとめて破棄。例: 新 PHOTO は VIDEO/AUDIO バッファを破棄、新 VIDEO は AUDIO バッファ + 表示中の写真を破棄、新 AUDIO は VIDEO バッファ + 表示中の写真を破棄、新 MOVIE は写真をクリアしつつ VIDEO/AUDIO バッファ両方を新規セッションで上書き
 - 保存ボタン: 蓄積優先度 **動画+音声 (MOVIE) > 動画 (VIDEO) > 音声 (AUDIO) > 写真 (PHOTO)**。それぞれ MediaStore (`Movies/TapPhotoCxrl` / `Movies/TapPhotoCxrl` / `Music/TapPhotoCxrl` / `Pictures/TapPhotoCxrl`) に書き出す
   - **VIDEO** (動画): jcodec で MP4 を作成。各フレームの撮影 `ts` から **1.5×period 以上の隙間** を検出すると前フレームを複製で穴埋めし、playback FPS = `1000/period_ms` で実時間再生に揃える
   - **AUDIO** (音声): 44 byte RIFF header (16 kHz / mono / 16-bit) を頭に付けて PCM body をコピーした WAV
-  - **MOVIE** (動画+音声): 3 段パイプライン。① jcodec で video-only MP4 を作る (VIDEO と同じパス) → ② `MediaCodec` (AAC LC / 64 kbps) で PCM → audio-only MP4 → ③ `MediaExtractor` + `MediaMuxer` で両 track を再エンコードなしで 1 本の MP4 に mux
+  - **MOVIE** (動画+音声): 3 段パイプライン。① `MediaEncoder.encodeVideoMp4` で video-only MP4 (VIDEO と同じパス) → ② `MediaEncoder.encodePcmToAacMp4` (AAC LC / 64 kbps) → ③ `MediaEncoder.combineAvMp4` で両 track を再エンコードなしで 1 本の MP4 に mux
 - スマホ→グラスの送信は `session_open` / `ping` / `session_close` のみ (キャプチャトリガは全て glass-local)
 
 ## アーキテクチャ
@@ -177,12 +176,13 @@ write("ts"),    writeInt64(<epoch ms>)
 `frame` の追加フィールド (`ts` は **撮影時刻** = ImageReader callback 時点):
 
 ```
-write("kind"), write("photo" | "video" | "movie")
 write("w"),    writeInt32(<width>)
 write("h"),    writeInt32(<height>)
 write("rot"),  writeInt32(<degrees, 通常 SENSOR_ORIENTATION>)
 write("data"), write(<JPEG bytes>)         // TYPE_BINARY
 ```
+
+frame 自体に種別を持たせない (写真かフレームかは phone 側のセッション状態で判断)。
 
 `capture_start` の追加フィールド (`kind` は開始したセッションの種別。`period_ms` は VIDEO / MOVIE のときだけ載る — phone はこれを動画 playback FPS と gap-fill 閾値に使う):
 

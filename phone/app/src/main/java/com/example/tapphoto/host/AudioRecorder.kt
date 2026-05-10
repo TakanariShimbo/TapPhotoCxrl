@@ -1,6 +1,5 @@
 package com.example.tapphoto.host
 
-import android.content.Context
 import android.util.Log
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -15,9 +14,9 @@ private const val PCM_FILE_EXT = ".pcm"
 /**
  * Buffers an in-progress audio recording. Audio bytes (16 kHz mono 16-bit
  * signed PCM) arrive on the binder thread from Hi Rokid via IAudioStreamCbk
- * and are written incrementally to a temp file in cacheDir — keeping memory
- * flat regardless of recording length. On stop the file is left in place so
- * the user can hit Save (which converts PCM → WAV via MediaSaver).
+ * and are written incrementally to a temp file under [cacheDir] — keeping
+ * memory flat regardless of recording length. On stop the file is left in
+ * place so the user can hit Save (which converts PCM → WAV via MediaSaver).
  *
  * Lifecycle is parallel to VideoRecorder but stores a single PCM stream
  * instead of a frame list.
@@ -36,12 +35,11 @@ object AudioRecorder {
     private val _hasContent = MutableStateFlow(false)
     val hasContent: StateFlow<Boolean> = _hasContent.asStateFlow()
 
-    fun startNewSession(context: Context) {
+    fun startNewSession(cacheDir: File) {
         synchronized(lock) {
             closeStreamLocked()
             deletePcmFileLocked()
-            val dir = context.cacheDir
-            val file = File(dir, "$PCM_FILE_PREFIX${System.currentTimeMillis()}$PCM_FILE_EXT")
+            val file = File(cacheDir, "$PCM_FILE_PREFIX${System.currentTimeMillis()}$PCM_FILE_EXT")
             pcmFile = file
             pcmStream = FileOutputStream(file, false)
             byteCount = 0L

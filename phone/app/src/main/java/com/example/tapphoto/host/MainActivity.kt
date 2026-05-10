@@ -62,8 +62,6 @@ private fun isPackageInstalled(context: Context, pkg: String): Boolean =
         false
     }
 
-enum class ConnectionState { DISCONNECTED, CONNECTING, CONNECTED }
-
 private const val AUTH_REQUEST_CODE = 1001
 
 class MainActivity : ComponentActivity() {
@@ -112,17 +110,13 @@ fun MainScreen(
     val authorized = token != null
     val running by ConnectionService.running.collectAsState()
     val cxrState by ConnectionService.connState.collectAsState()
-    val connection = when {
-        !running -> ConnectionState.DISCONNECTED
-        cxrState == CxrConnState.CONNECTED -> ConnectionState.CONNECTED
-        else -> ConnectionState.CONNECTING
-    }
+    val connection = if (running) cxrState else ConnectionState.DISCONNECTED
     val photo by PhotoStore.latest.collectAsState()
     val capturedAt by PhotoStore.capturedAt.collectAsState()
     val latestFrame by PhotoStore.latestFrame.collectAsState()
     val fps by FpsTracker.fps.collectAsState()
-    val glassMode by ConnectionService.glassMode.collectAsState()
-    val videoActive by ConnectionService.videoActive.collectAsState()
+    val captureMode by ConnectionService.captureMode.collectAsState()
+    val videoRecording by VideoRecorder.recording.collectAsState()
     val videoFrameCount by VideoRecorder.frameCount.collectAsState()
     val audioRecording by AudioRecorder.recording.collectAsState()
     val audioHasContent by AudioRecorder.hasContent.collectAsState()
@@ -155,7 +149,7 @@ fun MainScreen(
             hiRokidInstalled = hiRokidInstalled,
             authorized = authorized,
             connection = connection,
-            glassMode = glassMode,
+            captureMode = captureMode,
             modeKnown = connection == ConnectionState.CONNECTED,
         )
         ActionButtons(
@@ -176,7 +170,7 @@ fun MainScreen(
             onClear = PhotoStore::clear,
         )
         val saveOption = computeSaveOption(
-            videoActive = videoActive,
+            videoRecording = videoRecording,
             audioRecording = audioRecording,
             videoFrameCount = videoFrameCount,
             hasAudio = audioHasContent,
@@ -219,13 +213,13 @@ private data class SaveOption(
 )
 
 private fun computeSaveOption(
-    videoActive: Boolean,
+    videoRecording: Boolean,
     audioRecording: Boolean,
     videoFrameCount: Int,
     hasAudio: Boolean,
     hasPhoto: Boolean,
 ): SaveOption? {
-    if (videoActive || audioRecording) return null
+    if (videoRecording || audioRecording) return null
     val hasVideo = videoFrameCount > 0
     return when {
         hasVideo && hasAudio -> SaveOption(
@@ -287,7 +281,7 @@ private fun StatusCard(
     hiRokidInstalled: Boolean,
     authorized: Boolean,
     connection: ConnectionState,
-    glassMode: GlassMode,
+    captureMode: CaptureMode,
     modeKnown: Boolean,
 ) {
     ElevatedCard(modifier = Modifier.fillMaxWidth()) {
@@ -299,7 +293,7 @@ private fun StatusCard(
             StatusRow("Hi Rokid", if (hiRokidInstalled) "installed" else "not installed")
             StatusRow("Authorization", if (authorized) "yes" else "no")
             StatusRow("Connection", connection.name.lowercase())
-            StatusRow("Mode", if (modeKnown) glassMode.name.lowercase() else "—")
+            StatusRow("Mode", if (modeKnown) captureMode.toWire() else "—")
         }
     }
 }

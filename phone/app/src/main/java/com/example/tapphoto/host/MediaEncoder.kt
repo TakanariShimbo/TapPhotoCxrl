@@ -1,16 +1,20 @@
 package com.example.tapphoto.host
 
+import android.graphics.Bitmap
 import android.media.MediaCodec
 import android.media.MediaCodecInfo
 import android.media.MediaExtractor
 import android.media.MediaFormat
 import android.media.MediaMuxer
 import android.util.Log
+import org.jcodec.api.android.AndroidSequenceEncoder
+import org.jcodec.common.io.NIOUtils
+import org.jcodec.common.model.Rational
 import java.io.File
 import java.io.FileInputStream
 import java.nio.ByteBuffer
 
-private const val TAG = "MovieEncoder"
+private const val TAG = "MediaEncoder"
 
 private const val MIME_AUDIO = "audio/mp4a-latm"
 private const val AUDIO_BITRATE = 64_000
@@ -22,15 +26,53 @@ private const val PCM_READ_CHUNK = 4_096
 private const val SAMPLE_BUFFER_BYTES = 1024 * 1024
 
 /**
- * MOVIE save helpers. Approach: make a video-only MP4 with jcodec
- * (`MediaSaver` does this internally for VIDEO mode too) + an audio-only MP4
- * (AAC) here, then mux the tracks of those two files into a single MP4 with
- * MediaExtractor + MediaMuxer. Doing the video and audio passes
- * independently sidesteps the encoder-color-format / stride pitfalls of
- * feeding MediaCodec H.264 with raw bitmaps directly — both proven paths
- * (jcodec for video, MediaCodec for AAC) are kept untouched.
+ * All encoding helpers used by [MediaSaver]:
+ *   - [encodeVideoMp4]      JPEG frame list → video-only MP4 (jcodec)
+ *   - [encodePcmToAacMp4]   raw PCM         → audio-only MP4 (MediaCodec/AAC)
+ *   - [combineAvMp4]        v.mp4 + a.mp4   → muxed MP4 (no re-encode)
+ *
+ * Splitting video and audio passes sidesteps MediaCodec H.264 color/stride
+ * pitfalls — both proven paths are kept untouched.
  */
-object MovieEncoder {
+object MediaEncoder {
+
+    /**
+     * JPEG frame list → video-only MP4 with gap-fill. `periodMs` is the
+     * authoritative glass-side capture period (received in `capture_start`),
+     * used to detect dropped frames and to set the playback FPS so the
+     * encoded video runs at real time.
+     */
+    fun encodeVideoMp4(frames: List<GlassFrame>, periodMs: Long, outputFile: File) {
+        val period = periodMs.coerceAtLeast(1L)
+        val expanded = expandWithGapFill(frames, period)
+        val fps = computePlaybackFps(period)
+        Log.d(TAG, "encodeVideoMp4 origFrames=${frames.size} expanded=${expanded.size} period=${period}ms fps=${fps.num}/${fps.den}")
+        val out = NIOUtils.writableChannel(outputFile)
+        try {
+            val encoder = AndroidSequenceEncoder(out, fps)
+            // Decode each unique frame once; reuse for duplicates that fill gaps.
+            var lastJpeg: ByteArray? = null
+            var lastBitmap: Bitmap? = null
+            for (frame in expanded) {
+                val bmp = if (frame.jpeg === lastJpeg && lastBitmap != null && !lastBitmap.isRecycled) {
+                    lastBitmap
+                } else {
+                    lastBitmap?.recycle()
+                    val decoded = GlassImage.decode(frame) ?: continue
+                    lastJpeg = frame.jpeg
+                    lastBitmap = decoded
+                    decoded
+                }
+                val even = ensureEvenDimensions(bmp)
+                encoder.encodeImage(even)
+                if (even !== bmp) even.recycle()
+            }
+            lastBitmap?.recycle()
+            encoder.finish()
+        } finally {
+            NIOUtils.closeQuietly(out)
+        }
+    }
 
     /**
      * PCM (16 kHz / mono / 16-bit) → AAC LC inside an MP4 container.
@@ -160,6 +202,44 @@ object MovieEncoder {
             runCatching { outMuxer.release() }
         }
         Log.d(TAG, "combineAvMp4: ${videoMp4.length()} + ${audioMp4.length()} -> ${outputMp4.length()} bytes")
+    }
+
+    /**
+     * Where consecutive timestamps are >1.5× the period apart, repeat the
+     * previous frame to fill. Each duplicate keeps the original `jpeg`
+     * reference so the encoder can avoid re-decoding (see encodeVideoMp4).
+     */
+    private fun expandWithGapFill(frames: List<GlassFrame>, periodMs: Long): List<GlassFrame> {
+        if (frames.size < 2) return frames
+        val threshold = (periodMs * 3) / 2
+        val out = ArrayList<GlassFrame>(frames.size)
+        for (i in frames.indices) {
+            out.add(frames[i])
+            if (i == frames.size - 1) continue
+            val actualGap = frames[i + 1].timestampMs - frames[i].timestampMs
+            if (actualGap > threshold) {
+                val nFill = ((actualGap / periodMs) - 1).toInt().coerceAtLeast(0)
+                repeat(nFill) { out.add(frames[i]) }
+            }
+        }
+        return out
+    }
+
+    /**
+     * Playback FPS = 1000 / periodMs (clamped). After expandWithGapFill the
+     * frame list is uniform at periodMs intervals, so encoding at this rate
+     * yields real-time playback.
+     */
+    private fun computePlaybackFps(periodMs: Long): Rational {
+        val fpsX100 = (100_000L / periodMs).toInt().coerceIn(50, 6000)
+        return Rational.R(fpsX100, 100)
+    }
+
+    private fun ensureEvenDimensions(src: Bitmap): Bitmap {
+        val w = src.width and 1.inv()
+        val h = src.height and 1.inv()
+        return if (w == src.width && h == src.height) src
+        else Bitmap.createBitmap(src, 0, 0, w, h)
     }
 
     private fun findTrack(extractor: MediaExtractor, mimePrefix: String): Int? {

@@ -12,6 +12,9 @@ private const val TAG = "GlassImage"
  * One frame received from the glass over the `frame` event channel. The JPEG
  * bytes are kept verbatim for save-to-disk; rotation is applied lazily when
  * decoding to a Bitmap.
+ *
+ * No `kind` field on the frame — photo vs continuous is decided by the
+ * receiving session state (VideoRecorder.recording), not the frame itself.
  */
 data class GlassFrame(
     val jpeg: ByteArray,
@@ -19,15 +22,11 @@ data class GlassFrame(
     val height: Int,
     val rotation: Int,
     val timestampMs: Long,
-    val kind: String,   // "photo" | "video" | "movie"
 )
 
 /**
- * Parser + decoder for `frame` Caps payloads.
- *
- * Wire format (Caps from glass):
+ * Parser + decoder for `frame` Caps payloads. Wire format:
  *   "event"  string  = "frame"
- *   "kind"   string  "photo" | "video" | "movie"
  *   "w"      int32
  *   "h"      int32
  *   "rot"    int32   sensor orientation (degrees, clockwise)
@@ -37,17 +36,16 @@ data class GlassFrame(
 object GlassImage {
 
     fun parse(caps: Caps): GlassFrame? {
-        val data = readBinary(caps, "data") ?: run {
+        val data = caps.readBinary(Wire.FIELD_DATA) ?: run {
             Log.w(TAG, "frame missing data binary")
             return null
         }
         return GlassFrame(
             jpeg = data,
-            width = readInt32(caps, "w") ?: 0,
-            height = readInt32(caps, "h") ?: 0,
-            rotation = readInt32(caps, "rot") ?: 0,
-            timestampMs = readInt64(caps, "ts") ?: System.currentTimeMillis(),
-            kind = readString(caps, "kind") ?: "photo",
+            width = caps.readInt32(Wire.FIELD_W) ?: 0,
+            height = caps.readInt32(Wire.FIELD_H) ?: 0,
+            rotation = caps.readInt32(Wire.FIELD_ROT) ?: 0,
+            timestampMs = caps.readInt64(Wire.FIELD_TS) ?: System.currentTimeMillis(),
         )
     }
 
@@ -66,55 +64,4 @@ object GlassImage {
         if (rotated !== src) src.recycle()
         return rotated
     }
-
-    private fun readString(caps: Caps, fieldName: String): String? = runCatching {
-        for (i in 0 until caps.size() - 1) {
-            val key = caps.at(i)
-            if (key.type() == Caps.Value.TYPE_STRING && key.string == fieldName) {
-                val v = caps.at(i + 1)
-                if (v.type() == Caps.Value.TYPE_STRING) return@runCatching v.string
-            }
-        }
-        null
-    }.getOrNull()
-
-    private fun readInt32(caps: Caps, fieldName: String): Int? = runCatching {
-        for (i in 0 until caps.size() - 1) {
-            val key = caps.at(i)
-            if (key.type() == Caps.Value.TYPE_STRING && key.string == fieldName) {
-                val v = caps.at(i + 1)
-                if (v.type() == Caps.Value.TYPE_INT32 || v.type() == Caps.Value.TYPE_UINT32) {
-                    return@runCatching v.int
-                }
-            }
-        }
-        null
-    }.getOrNull()
-
-    private fun readInt64(caps: Caps, fieldName: String): Long? = runCatching {
-        for (i in 0 until caps.size() - 1) {
-            val key = caps.at(i)
-            if (key.type() == Caps.Value.TYPE_STRING && key.string == fieldName) {
-                val v = caps.at(i + 1)
-                if (v.type() == Caps.Value.TYPE_INT64 || v.type() == Caps.Value.TYPE_UINT64) {
-                    return@runCatching v.long
-                }
-            }
-        }
-        null
-    }.getOrNull()
-
-    private fun readBinary(caps: Caps, fieldName: String): ByteArray? = runCatching {
-        for (i in 0 until caps.size() - 1) {
-            val key = caps.at(i)
-            if (key.type() == Caps.Value.TYPE_STRING && key.string == fieldName) {
-                val v = caps.at(i + 1)
-                if (v.type() == Caps.Value.TYPE_BINARY) {
-                    val bin = v.binary
-                    return@runCatching bin.data.copyOfRange(bin.offset, bin.offset + bin.length)
-                }
-            }
-        }
-        null
-    }.getOrNull()
 }

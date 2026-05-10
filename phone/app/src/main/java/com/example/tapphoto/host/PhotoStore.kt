@@ -9,7 +9,7 @@ import kotlinx.coroutines.flow.asStateFlow
  * Holds the most recent frame received from the glass.
  *  - `latest`: decoded + rotated ImageBitmap for display
  *  - `latestFrame`: raw GlassFrame (JPEG bytes + metadata) for save-to-disk
- *  - `capturedAt`: receive time for UI timestamp
+ *  - `capturedAt`: glass-side capture timestamp (from frame.timestampMs)
  */
 object PhotoStore {
     private val _latest = MutableStateFlow<ImageBitmap?>(null)
@@ -23,7 +23,7 @@ object PhotoStore {
 
     fun set(image: ImageBitmap, frame: GlassFrame) {
         _latest.value = image
-        _capturedAt.value = System.currentTimeMillis()
+        _capturedAt.value = frame.timestampMs
         _latestFrame.value = frame
     }
 
