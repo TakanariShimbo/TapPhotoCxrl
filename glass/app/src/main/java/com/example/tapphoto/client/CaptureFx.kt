@@ -62,19 +62,24 @@ private const val FLASH_PEAK_ALPHA = 0.45f
 fun CaptureFx(state: CaptureState, mode: CaptureMode) {
     val showBrackets = state == CaptureState.CAPTURING ||
         state == CaptureState.CAPTURED ||
-        state == CaptureState.STREAMING
+        state == CaptureState.STREAMING ||
+        state == CaptureState.FILMING
 
     Box(modifier = Modifier.fillMaxSize()) {
         ModeBadge(
             mode = mode,
             streaming = state == CaptureState.STREAMING,
             recording = state == CaptureState.RECORDING,
+            filming = state == CaptureState.FILMING,
             modifier = Modifier
                 .align(Alignment.TopCenter)
                 .padding(top = 12.dp),
         )
 
-        if (state == CaptureState.STREAMING || state == CaptureState.RECORDING) {
+        if (state == CaptureState.STREAMING ||
+            state == CaptureState.RECORDING ||
+            state == CaptureState.FILMING
+        ) {
             StopHint(
                 modifier = Modifier
                     .align(Alignment.BottomCenter)
@@ -142,11 +147,17 @@ fun CaptureFx(state: CaptureState, mode: CaptureMode) {
                     color = Color(0xFFCCCCCC),
                     fontSize = 32.sp,
                 )
+                state == CaptureState.IDLE && mode == CaptureMode.MOVIE -> Text(
+                    text = "タップで動画録画",
+                    color = Color(0xFFCCCCCC),
+                    fontSize = 32.sp,
+                )
                 state == CaptureState.RECORDING -> RecText()
                 state == CaptureState.FAILED -> Text(
                     text = when (mode) {
                         CaptureMode.STREAM -> "ストリーム失敗"
                         CaptureMode.VOICE -> "録音失敗"
+                        CaptureMode.MOVIE -> "動画録画失敗"
                         CaptureMode.SHOT -> "撮影失敗"
                     },
                     color = Color(0xFFC04040),
@@ -163,6 +174,7 @@ private fun ModeBadge(
     mode: CaptureMode,
     streaming: Boolean,
     recording: Boolean,
+    filming: Boolean,
     modifier: Modifier = Modifier,
 ) {
     Row(
@@ -170,13 +182,18 @@ private fun ModeBadge(
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(6.dp),
     ) {
-        if (mode == CaptureMode.STREAM) LiveDot(active = streaming)
-        if (mode == CaptureMode.VOICE) LiveDot(active = recording)
+        when (mode) {
+            CaptureMode.STREAM -> LiveDot(active = streaming)
+            CaptureMode.VOICE -> LiveDot(active = recording)
+            CaptureMode.MOVIE -> LiveDot(active = filming)
+            CaptureMode.SHOT -> Unit
+        }
         Text(
             text = when (mode) {
                 CaptureMode.SHOT -> "SHOT"
                 CaptureMode.STREAM -> "STREAM"
                 CaptureMode.VOICE -> "VOICE"
+                CaptureMode.MOVIE -> "MOVIE"
             },
             color = Color(0xFF888888),
             fontSize = 12.sp,

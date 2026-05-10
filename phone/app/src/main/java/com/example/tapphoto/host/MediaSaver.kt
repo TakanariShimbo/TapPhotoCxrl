@@ -128,6 +128,79 @@ object MediaSaver {
         }
     }
 
+    suspend fun saveMovie(
+        ctx: Context,
+        frames: List<GlassFrame>,
+        periodMs: Long,
+        voicePcm: VoiceSnapshot?,
+        displayName: String,
+    ): Uri? = withContext(Dispatchers.IO) {
+        if (frames.isEmpty()) return@withContext null
+        val ts = System.currentTimeMillis()
+        val tempVideo = File(ctx.cacheDir, "movie_video_$ts.mp4")
+        val tempAudio = File(ctx.cacheDir, "movie_audio_$ts.mp4")
+        val tempFile = File(ctx.cacheDir, "movie_combined_$ts.mp4")
+        try {
+            // Step 1: video-only MP4 via the same jcodec path saveVideo uses
+            // (this is the path that already works for STREAM-only saves).
+            encodeMp4(frames, periodMs, tempVideo)
+            val pcmReady = voicePcm != null && voicePcm.pcmFile.exists() && voicePcm.byteCount > 0L
+            if (pcmReady) {
+                // Step 2: PCM → AAC inside an MP4 container.
+                MovieEncoder.encodePcmToAacMp4(voicePcm!!.pcmFile, tempAudio)
+                // Step 3: copy both tracks into the final MP4 (no re-encode).
+                MovieEncoder.combineAvMp4(tempVideo, tempAudio, tempFile)
+            } else {
+                // Fall back to video-only if the audio side somehow has no PCM.
+                tempVideo.copyTo(tempFile, overwrite = true)
+            }
+        } catch (t: Throwable) {
+            Log.w(TAG, "saveMovie encode failed", t)
+            tempVideo.delete(); tempAudio.delete(); tempFile.delete()
+            return@withContext null
+        }
+
+        val resolver = ctx.contentResolver
+        val collection = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            MediaStore.Video.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY)
+        } else {
+            @Suppress("DEPRECATION")
+            MediaStore.Video.Media.EXTERNAL_CONTENT_URI
+        }
+        val values = ContentValues().apply {
+            put(MediaStore.Video.Media.DISPLAY_NAME, displayName)
+            put(MediaStore.Video.Media.MIME_TYPE, "video/mp4")
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                put(MediaStore.Video.Media.RELATIVE_PATH, "Movies/$SUBDIR")
+                put(MediaStore.Video.Media.IS_PENDING, 1)
+            }
+        }
+        val uri = resolver.insert(collection, values) ?: run {
+            tempFile.delete()
+            return@withContext null
+        }
+        try {
+            resolver.openOutputStream(uri)?.use { out ->
+                tempFile.inputStream().use { it.copyTo(out) }
+            } ?: run {
+                resolver.delete(uri, null, null)
+                return@withContext null
+            }
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                values.clear()
+                values.put(MediaStore.Video.Media.IS_PENDING, 0)
+                resolver.update(uri, values, null, null)
+            }
+            uri
+        } catch (t: Throwable) {
+            Log.w(TAG, "saveMovie copy failed", t)
+            runCatching { resolver.delete(uri, null, null) }
+            null
+        } finally {
+            tempVideo.delete(); tempAudio.delete(); tempFile.delete()
+        }
+    }
+
     suspend fun saveAudio(
         ctx: Context,
         snapshot: VoiceSnapshot,

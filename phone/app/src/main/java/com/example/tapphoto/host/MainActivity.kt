@@ -181,8 +181,26 @@ fun MainScreen(
             hasVoice = voiceHasContent,
             hasPhoto = latestFrame != null,
             onSave = {
+                val hasVideoBuffer = streamFrameCount > 0 && !streaming
+                val hasVoiceBuffer = voiceHasContent && !voiceRecording
                 when {
-                    streamFrameCount > 0 && !streaming -> {
+                    // MOVIE = video frames + voice from the same session
+                    hasVideoBuffer && hasVoiceBuffer -> {
+                        val frames = StreamRecorder.snapshot()
+                        val voiceSnap = VoiceRecorder.snapshot()
+                        if (frames.isEmpty() || voiceSnap == null) return@SaveButton
+                        scope.launch {
+                            val name = "tapphoto_${fileFmt.format(Date())}.mp4"
+                            Toast.makeText(context, "エンコード中…", Toast.LENGTH_SHORT).show()
+                            val uri = MediaSaver.saveMovie(context, frames, StreamRecorder.periodMs, voiceSnap, name)
+                            Toast.makeText(
+                                context,
+                                if (uri != null) "保存しました: Movies/TapPhotoCxrl/$name" else "保存に失敗",
+                                Toast.LENGTH_LONG,
+                            ).show()
+                        }
+                    }
+                    hasVideoBuffer -> {
                         val frames = StreamRecorder.snapshot()
                         if (frames.isEmpty()) return@SaveButton
                         scope.launch {
@@ -196,7 +214,7 @@ fun MainScreen(
                             ).show()
                         }
                     }
-                    voiceHasContent && !voiceRecording -> {
+                    hasVoiceBuffer -> {
                         val snap = VoiceRecorder.snapshot() ?: return@SaveButton
                         scope.launch {
                             val name = "tapphoto_${fileFmt.format(Date())}.wav"
@@ -237,10 +255,12 @@ private fun SaveButton(
 ) {
     val asVideo = videoFrameCount > 0 && !streaming
     val asAudio = hasVoice && !recording
+    val asMovie = asVideo && asAudio
     val busy = streaming || recording
-    val enabled = !busy && (asVideo || asAudio || hasPhoto)
+    val enabled = !busy && (asMovie || asVideo || asAudio || hasPhoto)
     val label = when {
         busy -> "保存"
+        asMovie -> "保存 (動画+音声)"
         asVideo -> "保存 (動画)"
         asAudio -> "保存 (音声)"
         hasPhoto -> "保存 (写真)"

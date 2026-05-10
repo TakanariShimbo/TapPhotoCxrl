@@ -7,9 +7,10 @@
 - **SHOT モード**: グラスでタップ → グラス側 Camera2 で 1024×768 を 1 枚撮影 → JPEG をスマホへ送って最新 1 枚として表示
 - **STREAM モード**: グラスでタップで開始/停止 → グラス側 Camera2 で 480×360 を **固定周期** で連続キャプチャ → スマホでライブプレビュー (fps 表示付き)
 - **VOICE モード**: グラスでタップで開始/停止 → Hi Rokid の音声ストリーム (16 kHz mono PCM) をスマホで受信 (グラス側はトリガのみ、録音は Hi Rokid SDK 内部)
-- **モード切替**: グラスで前後スワイプ (DPAD_LEFT / DPAD_RIGHT) → `SHOT → STREAM → VOICE → SHOT` のサイクル
-- グラス側は HUD として **緑のコーナーブラケット → 白フラッシュ → ✓** のキャプチャ演出 + シャッター音 + 上端にモードバッジ (`SHOT` / `● STREAM` / `● VOICE`)
-- スマホ側は最新コンテンツを表示しつつ、**保存ボタン**でストレージに書き出し (SHOT → JPEG / STREAM → MP4 / VOICE → WAV、いずれも MediaStore へ。STREAM 動画は撮影時刻ベースで gap-fill)
+- **MOVIE モード**: STREAM + VOICE の同時録り (映像と音声を 1 本の MP4 に mux)
+- **モード切替**: グラスで前後スワイプ (DPAD_LEFT / DPAD_RIGHT) → `SHOT → STREAM → VOICE → MOVIE → SHOT` のサイクル
+- グラス側は HUD として **緑のコーナーブラケット → 白フラッシュ → ✓** のキャプチャ演出 + シャッター音 + 上端にモードバッジ (`SHOT` / `● STREAM` / `● VOICE` / `● MOVIE`)
+- スマホ側は最新コンテンツを表示しつつ、**保存ボタン**でストレージに書き出し (SHOT → JPEG / STREAM → MP4 / VOICE → WAV / MOVIE → 音声入り MP4、いずれも MediaStore へ。STREAM/MOVIE の動画は撮影時刻ベースで gap-fill)
 
 撮影パイプラインは `GlassCamera` (`glass/.../client/GlassCamera.kt`) に閉じ込めてあり、API は `takeShot(...)` / `startStream(...)` + `stopStream()` の 2 系統だけ。Hi Rokid `takePhoto()` の代替として使える。
 
@@ -54,7 +55,7 @@
 ## 動作概要
 
 ### グラス側
-画面上端中央にモードバッジ: `SHOT` / `● STREAM` / `● VOICE` (STREAM・VOICE 中は赤丸が点滅)。
+画面上端中央にモードバッジ: `SHOT` / `● STREAM` / `● VOICE` / `● MOVIE` (STREAM・VOICE・MOVIE 中は赤丸が点滅)。
 
 | Mode | State | 画面 | 音 |
 |---|---|---|---|
@@ -68,14 +69,17 @@
 | VOICE | IDLE | 「タップで録音」(灰) | 無音 |
 | VOICE | RECORDING | 中央に `● REC` (赤丸点滅 + 太字) + 「タップで停止」(下端、点滅) | 無音 |
 | VOICE | FAILED | 「録音失敗」(赤) | `TONE_PROP_NACK` |
+| MOVIE | IDLE | 「タップで動画録画」(灰) | 無音 |
+| MOVIE | FILMING | コーナーブラケット常時表示 + 「タップで停止」(下端、点滅) | 無音 |
+| MOVIE | FAILED | 「動画録画失敗」(赤) | `TONE_PROP_NACK` |
 | 接続中/未接続 | — | 「Connecting…」(灰) / 「Phone not connected」(赤) | — |
 
-CAPTURED / FAILED は **2 秒後に IDLE 復帰**。STREAMING / RECORDING は次のタップ (停止) または接続喪失まで継続。
+CAPTURED / FAILED は **2 秒後に IDLE 復帰**。STREAMING / RECORDING / FILMING は次のタップ (停止) または接続喪失まで継続。
 
 | ジェスチャ | キーコード | 動作 |
 |---|---|---|
-| シングルタップ | `KEYCODE_ENTER` | SHOT: 1 枚撮影 / STREAM: 開始⇄停止トグル / VOICE: 録音開始⇄停止トグル |
-| 前/後スワイプ | `KEYCODE_DPAD_LEFT/RIGHT` | モード循環 (`SHOT → STREAM → VOICE → SHOT`)。STREAMING / RECORDING 中なら停止してから切替 |
+| シングルタップ | `KEYCODE_ENTER` | SHOT: 1 枚撮影 / STREAM・MOVIE: 開始⇄停止トグル / VOICE: 録音開始⇄停止トグル |
+| 前/後スワイプ | `KEYCODE_DPAD_LEFT/RIGHT` | モード循環 (`SHOT → STREAM → VOICE → MOVIE → SHOT`)。STREAMING / RECORDING / FILMING 中なら停止してから切替 |
 
 ブラケット / ✓ / フラッシュ / モードバッジ は画像アセットを使わず Compose `Canvas` の `Path` で描画。シャッター音は `ToneGenerator` の合成音 (アセット同梱なし)。
 
@@ -84,9 +88,10 @@ CAPTURED / FAILED は **2 秒後に IDLE 復帰**。STREAMING / RECORDING は次
 1. `CameraDevice.openCamera` → `CameraCaptureSession` を `[previewSurface, jpegReader.surface]` 2 面で構成
 2. `TEMPLATE_PREVIEW` を repeating で流して AE/AWB を収束させる (起動直後のみ **700ms warmup**)
 3. `TEMPLATE_STILL_CAPTURE` を 1 ショット投げる → `ImageReader.OnImageAvailableListener` で JPEG bytes と **撮影時刻** を取得
-4. SHOT は 3 を 1 回だけ。STREAM は **撮影スレッド** (`glass-camera`) が `STREAM_FRAME_PERIOD_MS` (1000ms) の **固定周期** で 3 を打ち続ける (送信時間に引きずられない)
-5. STREAM の送信は別スレッド (`glass-bt-sender`) で動き、producer↔consumer 間は **容量 1 の slot** (`AtomicReference`)。送信が周期に追いつかなければ古いキューが新フレームに上書きされる (`queued frame skipped` ログ)。撮影時刻は wire の `ts` に載るので、phone は drop 区間を timestamp で検出できる
-6. 取得した JPEG は **回転を適用せず**、Caps に `rot = SENSOR_ORIENTATION` を載せて送信 (回転はスマホ側で実施)
+4. SHOT は 3 を 1 回だけ。STREAM / MOVIE は **撮影スレッド** (`glass-camera`) が `STREAM_FRAME_PERIOD_MS` (1000ms) の **固定周期** で 3 を打ち続ける (送信時間に引きずられない)
+5. STREAM / MOVIE の送信は別スレッド (`glass-bt-sender`) で動き、producer↔consumer 間は **容量 1 の slot** (`AtomicReference`)。送信が周期に追いつかなければ古いキューが新フレームに上書きされる (`queued frame skipped` ログ)。撮影時刻は wire の `ts` に載るので、phone は drop 区間を timestamp で検出できる
+6. 取得した JPEG は **回転を適用せず**、Caps に `rot = SENSOR_ORIENTATION` を載せて送信 (回転はスマホ側で実施)。frame の `kind` は STREAM 中は `stream`、MOVIE 中は `movie`
+7. MOVIE は STREAM のフロー (1〜6) に加えて、開始時に `movie_start` イベントを送るだけで音声録音は phone 側で `cxrLink.startAudioStream(1)` を呼んで Hi Rokid SDK に任せる (グラス側は音声に触れない)
 
 ### スマホ側
 - Hi Rokid 認証 → token を `EncryptedSharedPreferences` に永続化
@@ -97,14 +102,19 @@ CAPTURED / FAILED は **2 秒後に IDLE 復帰**。STREAMING / RECORDING は次
   - STREAM 中: 「**ライブ映像 (X.X fps)**」 — `FpsTracker` がローリング平均で算出
 - グラスからのイベント別動作:
   - `frame{kind=shot, w, h, rot, ts, data}` → `GlassImage.decodeFrame` で回転込み Bitmap → `PhotoStore`
-  - `frame{kind=stream, ...}` → 同上 + `FpsTracker.tick` + `StreamRecorder.add` (mp4 化用に蓄積)
+  - `frame{kind=stream, ...}` / `frame{kind=movie, ...}` → 同上 + `FpsTracker.tick` + `StreamRecorder.add` (mp4 化用に蓄積)
   - `stream_start{period_ms}` → 内部状態 `Streaming` へ。`StreamRecorder.startNewSession(period_ms)` で受信周期を保持
   - `stream_end` → 内部状態 `Idle` へ
   - `voice_start` → `cxrLink.startAudioStream(1)` を呼んで Hi Rokid から PCM をストリーミング受信開始。`VoiceRecorder.startNewSession` で `cacheDir/voice_<ts>.pcm` を開き、`IAudioStreamCbk.onAudioReceived` (binder thread) で逐次書き出し
   - `voice_end` → `cxrLink.stopAudioStream()` + PCM ファイル close
-  - `mode_change{mode}` → スマホ側の表示モードを SHOT/STREAM/VOICE に同期
-- "newer wins" バッファ整合: 新 SHOT は STREAM/VOICE バッファを破棄、新 STREAM は VOICE バッファを破棄、新 VOICE は STREAM バッファ + 表示中の写真も破棄 (録音中に古い絵が残らないように)
-- 保存ボタン: 蓄積優先度 **動画 > 音声 > 写真**。それぞれ MediaStore (`Movies/TapPhotoCxrl` / `Music/TapPhotoCxrl` / `Pictures/TapPhotoCxrl`) に書き出す。MP4 は jcodec で、各フレームの撮影 `ts` から **1.5×period 以上の隙間** を検出すると前フレームを複製で穴埋めし、playback FPS = `1000/period_ms` で実時間再生に。WAV は 44 byte RIFF header (16 kHz / mono / 16-bit) を頭に付けて PCM body をコピー
+  - `movie_start{period_ms}` → 内部状態 `Filming` へ。`StreamRecorder` + `VoiceRecorder` を**両方**新セッション開始 + `cxrLink.startAudioStream(1)` を呼ぶ
+  - `movie_end` → `stopAudioStream()` + 両 Recorder クローズ
+  - `mode_change{mode}` → スマホ側の表示モードを SHOT/STREAM/VOICE/MOVIE に同期
+- "newer wins" バッファ整合: 新 SHOT は STREAM/VOICE バッファを破棄、新 STREAM は VOICE バッファを破棄、新 VOICE は STREAM バッファ + 表示中の写真も破棄、新 MOVIE は写真をクリアしつつ STREAM/VOICE バッファ両方を新規セッションで上書き
+- 保存ボタン: 蓄積優先度 **動画+音声 (MOVIE) > 動画 (STREAM) > 音声 (VOICE) > 写真 (SHOT)**。それぞれ MediaStore (`Movies/TapPhotoCxrl` / `Movies/TapPhotoCxrl` / `Music/TapPhotoCxrl` / `Pictures/TapPhotoCxrl`) に書き出す
+  - **STREAM** (動画): jcodec で MP4 を作成。各フレームの撮影 `ts` から **1.5×period 以上の隙間** を検出すると前フレームを複製で穴埋めし、playback FPS = `1000/period_ms` で実時間再生に揃える
+  - **VOICE** (音声): 44 byte RIFF header (16 kHz / mono / 16-bit) を頭に付けて PCM body をコピーした WAV
+  - **MOVIE** (動画+音声): 3 段パイプライン。① jcodec で video-only MP4 を作る (STREAM と同じパス) → ② `MediaCodec` (AAC LC / 64 kbps) で PCM → audio-only MP4 → ③ `MediaExtractor` + `MediaMuxer` で両 track を再エンコードなしで 1 本の MP4 に mux
 - スマホ→グラスの送信は `session_open` / `ping` / `session_close` のみ (キャプチャトリガは全て glass-local)
 
 ## アーキテクチャ
@@ -125,6 +135,7 @@ phone:                                       glass:
 │      ▲       │  frame (binary)      │              │
 │      │       │  stream_start/end    │              │
 │      │       │  voice_start/end     │              │
+│      │       │  movie_start/end     │              │
 │      │       │  mode_change         │              │
 │      │       │                      │              │
 │      │       │  IAudioStreamCbk     │              │
@@ -138,8 +149,9 @@ phone:                                       glass:
 ### glass-driven な責任分担
 
 - **トリガ・状態管理・UI フィードバック (シャッター音/✓ 表示)** は全部 glass-local
-- カメラ系 (SHOT / STREAM) はグラス側で Camera2 を直接叩いて JPEG をスマホへ送信
-- 音声 (VOICE) は録音そのものを Hi Rokid SDK に任せ (グラスはトリガを送るだけ)、スマホ側で PCM を受信
+- カメラ系 (SHOT / STREAM / MOVIE の映像側) はグラス側で Camera2 を直接叩いて JPEG をスマホへ送信
+- 音声 (VOICE / MOVIE の音声側) は録音そのものを Hi Rokid SDK に任せ (グラスはトリガを送るだけ)、スマホ側で PCM を受信
+- MOVIE は上の 2 つの合体: 同じトリガ (`movie_start` / `movie_end`) で映像と音声を同時に走らせ、保存時に MP4 へ mux
 - スマホ→glass の制御メッセージは存在しない (heartbeat と session lifecycle だけ)
 
 ### セッション handshake & heartbeat
@@ -156,7 +168,7 @@ HelloToggleCxrl と同じ application-level セッションを継承。
 | チャンネル | 方向 | `event` の取りうる値 |
 |---|---|---|
 | `rk_custom_client` | phone → glass | `session_open` / `session_close` / `ping` |
-| `rk_custom_key` | glass → phone | `frame` (binary 画像) / `stream_start` / `stream_end` / `voice_start` / `voice_end` / `mode_change` |
+| `rk_custom_key` | glass → phone | `frame` (binary 画像) / `stream_start` / `stream_end` / `voice_start` / `voice_end` / `movie_start` / `movie_end` / `mode_change` |
 | Hi Rokid audio stream | glass → phone | `IAudioStreamCbk.onAudioReceived(data, offset, length)` で raw PCM (16 kHz mono 16-bit) — Caps を経由せず SDK 内部の AIDL ストリーム |
 
 ペイロードは `com.rokid.cxr.Caps` を positional で書き込み (キー文字列とその値が交互に並ぶ)。共通フィールド:
@@ -169,14 +181,14 @@ write("ts"),    writeInt64(<epoch ms>)
 `frame` の追加フィールド (`ts` は **撮影時刻** = ImageReader callback 時点):
 
 ```
-write("kind"), write("shot" | "stream")
+write("kind"), write("shot" | "stream" | "movie")
 write("w"),    writeInt32(<width>)
 write("h"),    writeInt32(<height>)
 write("rot"),  writeInt32(<degrees, 通常 SENSOR_ORIENTATION>)
 write("data"), write(<JPEG bytes>)         // TYPE_BINARY
 ```
 
-`stream_start` の追加フィールド (撮影周期。phone はこれを動画 playback FPS と gap-fill 閾値に使う):
+`stream_start` / `movie_start` の追加フィールド (撮影周期。phone はこれを動画 playback FPS と gap-fill 閾値に使う):
 
 ```
 write("period_ms"), writeInt64(<glass の STREAM_FRAME_PERIOD_MS>)
@@ -185,10 +197,10 @@ write("period_ms"), writeInt64(<glass の STREAM_FRAME_PERIOD_MS>)
 `mode_change` の追加フィールド:
 
 ```
-write("mode"), write("shot" | "stream" | "voice")
+write("mode"), write("shot" | "stream" | "voice" | "movie")
 ```
 
-`voice_start` / `voice_end` は共通フィールドのみ (`event` + `ts`)。録音そのものはグラス側のアプリではなく Hi Rokid SDK が司り、phone 側で `cxrLink.startAudioStream(1)` / `stopAudioStream()` を呼んでストリームを購読する。
+`voice_start` / `voice_end` / `movie_end` は共通フィールドのみ (`event` + `ts`)。音声録音 (VOICE / MOVIE 両方) は Hi Rokid SDK が司り、phone 側で `cxrLink.startAudioStream(1)` / `stopAudioStream()` を呼んでストリームを購読する。
 
 > JPEG は Caps の binary フィールドに直接埋め込んで送る。`CXRServiceBridge.sendMessage(String, Caps, byte[])` の別 byte 引数経路は phone 側 (CXR-L) から拾えないため、Caps 内 binary に統一している。1024×768 q=80 で約 50KB / 480×360 q=50 で約 5KB の payload で動作確認済み。
 
@@ -253,6 +265,7 @@ cd ../phone
 4. **SHOT**: グラスをタップ → ブラケット出現 → ~1.5 秒後にスマホへ画像 + グラスは枠内フラッシュ + ✓ + シャッター音
 5. **STREAM**: 前/後スワイプ → モードバッジが `● STREAM` に → タップで連続撮影開始 → スマホ側パネルが「ライブ映像 (fps)」に切替 → もう一度タップで停止
 6. **VOICE**: もう一度スワイプ → モードバッジが `● VOICE` に → タップで録音開始 (中央に `● REC`) → もう一度タップで停止 → スマホ側で「保存 (音声)」ボタンが押せるようになる
+7. **MOVIE**: もう一度スワイプ → モードバッジが `● MOVIE` に → タップで音あり動画録画開始 → もう一度タップで停止 → スマホ側で「保存 (動画+音声)」が押せる
 
 接続を切るときはスマホで `[接続停止]`。再認証は `[再認証]` で token を破棄。
 
@@ -313,9 +326,10 @@ private const val FLASH_PEAK_ALPHA = 0.45f           // フラッシュ最大不
 
 ## 既知の制限
 
-- ストレージ書き出しは保存ボタン押下時のみ。STREAM フレームのバッファはアプリ kill / セッション再開で消える (永続化なし)
+- ストレージ書き出しは保存ボタン押下時のみ。STREAM/VOICE/MOVIE のバッファはアプリ kill / セッション再開で消える (永続化なし)
 - BT 物理切断 → 復帰時の自動再接続なし (手動で `[接続停止]` → `[接続開始]`)
 - token 期限切れの自動検出なし
 - グラス用 APK の自動デプロイは未実装 (手動 `adb install` 想定)
 - glass 側 Camera2 でカメラを掴んでいる間 Hi Rokid 純正のカメラ機能 (シャッターボタン撮影など) と競合する可能性 (現状未確認)
-- STREAM の BT スループット上限 ≒ 1 fps (Rokid Glass + 480×360 JPEG で安定動作する設定)。それより高い fps は LMK 殺しに当たりやすい
+- STREAM / MOVIE の BT スループット上限 ≒ 1 fps (Rokid Glass + 480×360 JPEG で安定動作する設定)。それより高い fps は LMK 殺しに当たりやすい
+- MOVIE の音声と映像は別々のクロックで録音/録画している (PCM は到着順、frame は `ts` 通り)。movie_start / movie_end を同時に発火してはいるが、BT 経由の到達タイミング差や Hi Rokid 側の音声バッファ遅延で 100ms 程度の音ズレが出る可能性あり

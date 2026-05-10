@@ -28,6 +28,7 @@ private const val STREAM_QUALITY = 50
 
 private const val FRAME_KIND_SHOT = "shot"
 private const val FRAME_KIND_STREAM = "stream"
+private const val FRAME_KIND_MOVIE = "movie"
 
 enum class BridgeStatus { DISCONNECTED, CONNECTING, CONNECTED }
 
@@ -41,11 +42,12 @@ enum class CaptureState {
     CAPTURING,   // single shot in flight
     CAPTURED,    // shot sent, showing brief feedback (auto reset)
     FAILED,      // capture or send failed (auto reset)
-    STREAMING,   // continuous capture in flight
-    RECORDING,   // voice recording in flight (audio handled by phone via Hi Rokid)
+    STREAMING,   // continuous capture in flight (no audio)
+    RECORDING,   // voice recording in flight (no video)
+    FILMING,     // MOVIE: continuous capture + voice recording (= STREAM + VOICE)
 }
 
-enum class CaptureMode { SHOT, STREAM, VOICE }
+enum class CaptureMode { SHOT, STREAM, VOICE, MOVIE }
 
 /**
  * State + protocol owner on the glass. Wire format:
@@ -83,6 +85,7 @@ object GlassBridge {
     private var senderHandler: Handler? = null
     private val streamSlot = AtomicReference<StreamFrame?>(null)
     private var lastFrameProducedAt = 0L
+    @Volatile private var currentFrameKind: String = FRAME_KIND_STREAM
 
     private data class StreamFrame(
         val jpeg: ByteArray,
@@ -170,6 +173,7 @@ object GlassBridge {
             CaptureMode.SHOT -> tapInShotMode()
             CaptureMode.STREAM -> tapInStreamMode()
             CaptureMode.VOICE -> tapInVoiceMode()
+            CaptureMode.MOVIE -> tapInMovieMode()
         }
     }
 
@@ -184,10 +188,14 @@ object GlassBridge {
         if (_captureState.value == CaptureState.RECORDING) {
             stopRecording("mode toggle")
         }
+        if (_captureState.value == CaptureState.FILMING) {
+            stopMovie("mode toggle")
+        }
         _mode.value = when (_mode.value) {
             CaptureMode.SHOT -> CaptureMode.STREAM
             CaptureMode.STREAM -> CaptureMode.VOICE
-            CaptureMode.VOICE -> CaptureMode.SHOT
+            CaptureMode.VOICE -> CaptureMode.MOVIE
+            CaptureMode.MOVIE -> CaptureMode.SHOT
         }
         sendModeChange()
     }
@@ -266,7 +274,8 @@ object GlassBridge {
         }
         cancelResultReset()
         _captureState.value = CaptureState.STREAMING
-        sendStreamStart()
+        currentFrameKind = FRAME_KIND_STREAM
+        sendStartEvent("stream_start")
         startSender()
         GlassCamera.startStream(
             ctx = ctx,
@@ -304,13 +313,14 @@ object GlassBridge {
      */
     private fun drainSlotOnce() {
         val f = streamSlot.getAndSet(null) ?: return
+        val kind = currentFrameKind
         val t0 = SystemClock.uptimeMillis()
         val ok = try {
-            sendFrame(FRAME_KIND_STREAM, f.jpeg, f.w, f.h, f.rot, f.captureTs)
+            sendFrame(kind, f.jpeg, f.w, f.h, f.rot, f.captureTs)
         } catch (t: Throwable) {
             Log.w(TAG, "stream sendFrame threw", t); false
         }
-        Log.d(TAG, "stream send: send=${SystemClock.uptimeMillis() - t0}ms ok=$ok size=${f.jpeg.size}")
+        Log.d(TAG, "stream send($kind): send=${SystemClock.uptimeMillis() - t0}ms ok=$ok size=${f.jpeg.size}")
     }
 
     private fun startSender() {
@@ -369,15 +379,72 @@ object GlassBridge {
         _captureState.value = CaptureState.IDLE
     }
 
+    // ---- movie ----
+    //
+    // MOVIE = STREAM (camera2 fixed-period capture) + VOICE (Hi Rokid mic).
+    // Glass-side flow is the union: start the same camera capture loop and
+    // also fire voice trigger so phone calls startAudioStream. Frames go out
+    // tagged kind=movie so phone can distinguish from a plain stream.
+
+    private fun tapInMovieMode() {
+        when (_captureState.value) {
+            CaptureState.IDLE -> startMovie()
+            CaptureState.FILMING -> stopMovie("user tap")
+            else -> Log.d(TAG, "movie tap ignored (state=${_captureState.value})")
+        }
+    }
+
+    private fun startMovie() {
+        val ctx = appContext ?: run {
+            Log.w(TAG, "startMovie dropped: no appContext")
+            return
+        }
+        cancelResultReset()
+        _captureState.value = CaptureState.FILMING
+        currentFrameKind = FRAME_KIND_MOVIE
+        sendStartEvent("movie_start")
+        startSender()
+        GlassCamera.startStream(
+            ctx = ctx,
+            width = STREAM_TARGET_W,
+            height = STREAM_TARGET_H,
+            quality = STREAM_QUALITY,
+            onFrame = ::onStreamFrameProduced,
+            onError = { reason ->
+                mainHandler.post { onMovieFailed(reason) }
+            },
+        )
+    }
+
+    private fun stopMovie(reason: String) {
+        if (_captureState.value != CaptureState.FILMING) return
+        Log.d(TAG, "stopMovie: $reason")
+        GlassCamera.stopStream()
+        sendEvent("movie_end")
+        stopSender()
+        _captureState.value = CaptureState.IDLE
+    }
+
+    private fun onMovieFailed(reason: String) {
+        Log.w(TAG, "movie failed: $reason")
+        if (_captureState.value != CaptureState.FILMING) return
+        GlassCamera.stopStream()
+        sendEvent("movie_end")
+        stopSender()
+        CameraSfx.playFail()
+        scheduleResetTo(CaptureState.FAILED)
+    }
+
     // ---- helpers ----
 
     private fun resetCapture(reason: String) {
         Log.d(TAG, "resetCapture: $reason (was ${_captureState.value})")
         cancelResultReset()
+        // Stops camera for STREAMING/FILMING; no-op otherwise. Voice has no
+        // glass-side stream — phone observes session_close / disconnect via
+        // its own watchdog and stops its audio stream there.
         GlassCamera.stopStream()
         stopSender()
-        // Voice has no glass-side stream to stop; phone observes session_close
-        // / disconnect via its own watchdog and stops its audio stream there.
         _captureState.value = CaptureState.IDLE
     }
 
@@ -415,19 +482,20 @@ object GlassBridge {
             .onFailure { Log.w(TAG, "sendMessage($event) failed", it) }
     }
 
-    private fun sendStreamStart() {
+    /** Sends stream_start or movie_start with the camera period. */
+    private fun sendStartEvent(event: String) {
         val b = bridge ?: run {
-            Log.w(TAG, "sendStreamStart dropped: bridge null")
+            Log.w(TAG, "sendStartEvent($event) dropped: bridge null")
             return
         }
-        Log.d(TAG, "-> stream_start period_ms=$STREAM_FRAME_PERIOD_MS")
+        Log.d(TAG, "-> $event period_ms=$STREAM_FRAME_PERIOD_MS")
         val caps = Caps().apply {
-            write("event"); write("stream_start")
+            write("event"); write(event)
             write("ts"); writeInt64(System.currentTimeMillis())
             write("period_ms"); writeInt64(STREAM_FRAME_PERIOD_MS)
         }
         runCatching { b.sendMessage(CHANNEL_TO_PHONE, caps) }
-            .onFailure { Log.w(TAG, "sendMessage(stream_start) failed", it) }
+            .onFailure { Log.w(TAG, "sendMessage($event) failed", it) }
     }
 
     private fun sendModeChange() {
@@ -436,6 +504,7 @@ object GlassBridge {
             CaptureMode.SHOT -> "shot"
             CaptureMode.STREAM -> "stream"
             CaptureMode.VOICE -> "voice"
+            CaptureMode.MOVIE -> "movie"
         }
         Log.d(TAG, "-> mode_change ($modeStr)")
         val caps = Caps().apply {

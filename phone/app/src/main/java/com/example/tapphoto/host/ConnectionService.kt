@@ -39,14 +39,18 @@ private const val HEARTBEAT_INTERVAL_MS = 5_000L
  * Phone-side viewer state. Glass owns capture lifecycle; phone is passive.
  *  - Idle: showing whatever the most recent shot was (or nothing)
  *  - Streaming: a stream is active on glass; tick FPS, show LIVE indicator
+ *  - Filming: MOVIE session — same frame storage as Streaming + audio capture
  */
 private sealed class ViewState {
     object Idle : ViewState()
     object Streaming : ViewState()
+    object Filming : ViewState()
 }
 
+private fun ViewState.isVideoActive(): Boolean = this is ViewState.Streaming || this is ViewState.Filming
+
 /** Capture mode mirrored from glass (driven by mode_change event). */
-enum class GlassMode { SHOT, STREAM, VOICE }
+enum class GlassMode { SHOT, STREAM, VOICE, MOVIE }
 
 /**
  * Foreground service that holds the CXRL link and renders frames coming from
@@ -174,6 +178,8 @@ class ConnectionService : Service() {
             "stream_end" -> handleStreamEnd()
             "voice_start" -> handleVoiceStart()
             "voice_end" -> handleVoiceEnd()
+            "movie_start" -> handleMovieStart(caps)
+            "movie_end" -> handleMovieEnd()
             "mode_change" -> handleModeChange(caps)
             else -> Log.d(TAG, "ignore unknown glass event: $event")
         }
@@ -185,6 +191,7 @@ class ConnectionService : Service() {
             "shot" -> GlassMode.SHOT
             "stream" -> GlassMode.STREAM
             "voice" -> GlassMode.VOICE
+            "movie" -> GlassMode.MOVIE
             else -> {
                 Log.w(TAG, "mode_change unknown mode=$modeStr")
                 return
@@ -198,7 +205,7 @@ class ConnectionService : Service() {
         val frame = GlassImage.parse(caps) ?: return
         val bitmap = GlassImage.decode(frame) ?: return
         PhotoStore.set(bitmap.asImageBitmap(), frame)
-        if (view is ViewState.Streaming) {
+        if (view.isVideoActive()) {
             FpsTracker.tick()
             StreamRecorder.add(frame)
         } else if (frame.kind == "shot") {
@@ -248,6 +255,37 @@ class ConnectionService : Service() {
         val ok = link?.stopAudioStream()
         Log.d(TAG, "stopAudioStream → $ok")
         VoiceRecorder.stopRecording()
+    }
+
+    private fun handleMovieStart(caps: Caps) {
+        val link = cxrLink ?: run {
+            Log.w(TAG, "movie_start ignored: cxrLink null")
+            return
+        }
+        val periodMs = readInt64(caps, "period_ms") ?: 1000L
+        Log.d(TAG, "<- movie_start period_ms=$periodMs (was=$view)")
+        // newer-wins: a movie session replaces any prior content (photo, plain
+        // stream, plain voice). Buffers are reused — same StreamRecorder for
+        // frames + same VoiceRecorder for PCM.
+        PhotoStore.clear()
+        StreamRecorder.startNewSession(periodMs)
+        VoiceRecorder.startNewSession(applicationContext)
+        view = ViewState.Filming
+        _streaming.value = true   // Same UI affordance as STREAM (live panel title)
+        FpsTracker.reset()
+        val ok = link.startAudioStream(1)
+        Log.d(TAG, "startAudioStream → $ok")
+    }
+
+    private fun handleMovieEnd() {
+        Log.d(TAG, "<- movie_end (was=$view)")
+        val link = cxrLink
+        val ok = link?.stopAudioStream()
+        Log.d(TAG, "stopAudioStream → $ok")
+        VoiceRecorder.stopRecording()
+        view = ViewState.Idle
+        _streaming.value = false
+        FpsTracker.reset()
     }
 
     // ---- helpers ----
